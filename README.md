@@ -21,40 +21,6 @@ pip install -r requirements.txt
 python examples/run_sample.py
 ```
 
-## Dashboard app
-
-The repo now includes a research dashboard at `app.py`.
-
-```bash
-streamlit run app.py
-```
-
-The dashboard supports:
-
-1. `moomoo live`: live option chain and Greeks through moomoo OpenD / OpenAPI
-2. `CSV upload`: normalized or long-form option chain CSV
-3. `sample`: built-in synthetic data
-
-## moomoo live setup
-
-The app is wired to **moomoo OpenD** as the primary live data source.
-
-1. Install and log in to OpenD locally.
-2. Install the Python SDK:
-
-```bash
-pip install moomoo-api
-```
-
-3. Start the app and point it at your OpenD host and port. The common local default is `127.0.0.1:11111`.
-
-The dashboard fetches:
-
-- underlying snapshot
-- option expiration dates
-- option chain contracts
-- option snapshots including bid/ask/last, volume, open interest, IV, delta, gamma, vega, and theta
-
 ## Codex prompt
 
 Open this folder in Codex and use `CODEX_PROMPT.md` as the first task prompt.
