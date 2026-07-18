@@ -3,6 +3,7 @@
 from ._backend import HAS_CPP_CORE
 from .elo import EloConfig, asymmetric_cost, build_elo_surface, build_symmetric_pairs
 from .flow import FlowConfig, FlowSummary, aggregate_large_flow
+from .inverse import InverseLink, InverseMarketData, InverseRegistry
 from .model import (
     Expectation,
     InverseConfig,
@@ -11,6 +12,7 @@ from .model import (
     OptionWaveV09,
     PDEConfig,
 )
+from .http_api import HTTPAPIConfig, HTTPAPIError, MarketBundle, MassiveHTTPClient
 
 __all__ = [
     "EloConfig",
@@ -27,4 +29,11 @@ __all__ = [
     "build_symmetric_pairs",
     "build_elo_surface",
     "aggregate_large_flow",
+    "HTTPAPIConfig",
+    "HTTPAPIError",
+    "MarketBundle",
+    "MassiveHTTPClient",
+    "InverseLink",
+    "InverseMarketData",
+    "InverseRegistry",
 ]

@@ -66,11 +66,15 @@ keeps the online ELO state; call `reset()` to start a fresh session.
 
 ## Data integration
 
-Recommended sources are moomoo OpenD/OpenAPI and the Schwab Developer API.
-They should feed the normalized schema above. Live whale-flow data is not a
-required input in v0.9: when supplied, it must be trade-level data with an
-observable aggressor side or bid/ask placement. Unknown direction is ignored,
-not guessed from the underlying price.
+The live-data boundary is HTTPS-only. Do not add a broker desktop daemon or
+moomoo/OpenD dependency. The included `MassiveHTTPClient` is a reference
+adapter for the Massive (formerly Polygon) REST shape; another web API can be
+used by implementing the same normalized schema. API keys belong in runtime
+environment variables or Cloudflare Worker secrets, never in the repository.
+
+Live whale-flow data is not a required input in v0.9: when supplied, it must be
+trade-level data with an observable aggressor side or bid/ask placement.
+Unknown direction is ignored, not guessed from the underlying price.
 
 ### Large-money flow
 
@@ -91,26 +95,42 @@ print(result.diagnostics["large_flow_notional"])
 print(result.diagnostics["flow_velocity"])
 ```
 
-### Inverse index confirmation
+### Universal inverse-instrument confirmation
 
-Pass a corresponding inverse option chain and state when available. For QQQ,
-SQQQ is a daily approximately `-3x` exposure, so set `inverse_beta=-3.0`;
-the inverse signal is mapped back to QQQ direction before entering the
-confidence-weighted composite source field:
+The model resolves every explicitly registered inverse product, not only QQQ.
+The built-in registry includes common index products such as `SPY -> SH/SDS`,
+`QQQ -> PSQ/QID/SQQQ`, `DIA -> DOG`, `IWM -> RWM`, and the currently listed
+single-stock examples `TSLA -> TSLS`, `AAPL -> AAPD`, and `AMD -> AMDD`.
+Custom relationships must be registered when a vendor lists an inverse ETP
+that is not in the conservative built-in set. A relationship is never guessed
+from a ticker name or correlation.
+
+Fetch each product independently through the HTTP adapter, then pass all
+available observations together:
 
 ```python
+from option_wave import InverseMarketData, InverseRegistry, MassiveHTTPClient
+
+registry = InverseRegistry()
+bundle = MassiveHTTPClient().fetch_market_bundle("SPY", registry=registry)
 result = model.predict(
-    qqq_chain,
-    MarketState(spot=720.0, symbol="QQQ"),
-    inverse_chain=sqqq_chain,
-    inverse_state=MarketState(spot=sqqq_spot, symbol="SQQQ"),
-    inverse_beta=-3.0,
+    bundle.chain,
+    bundle.state,
+    inverse_markets=bundle.inverses,
 )
 ```
 
-The composite signal uses confidence—not fixed hand-tuned factor weights—to
-combine the ELO field, premium/energy confirmation, verified large flow, and
-the inverse instrument. The diagnostics expose each component for audit.
+For a single-stock inverse ETP that is discovered from a provider's reference
+API, register it before fetching:
+
+```python
+registry.register("TSLA", "TSLS", -1.0, source="Direxion")
+```
+
+The inverse chain is analyzed in its own ELO surface and mapped back by the
+explicit daily beta. The diagnostics expose the participating symbols and
+count for audit. Because leveraged/inverse products reset daily, their signal
+is confirmation for the same session, not a long-horizon price equivalence.
 
 ## Performance design
 

@@ -5,7 +5,15 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from option_wave import MarketState, OptionWaveV09, aggregate_large_flow
+from option_wave import (
+    InverseLink,
+    InverseMarketData,
+    InverseRegistry,
+    MarketState,
+    MassiveHTTPClient,
+    OptionWaveV09,
+    aggregate_large_flow,
+)
 from option_wave.elo import EloConfig, asymmetric_cost, build_symmetric_pairs
 
 
@@ -147,6 +155,60 @@ class OptionWaveV09Tests(unittest.TestCase):
         self.assertIn("composite_signal", result.diagnostics)
         self.assertGreater(result.diagnostics["large_flow_gross_notional"], 0.0)
         self.assertNotEqual(result.diagnostics["inverse_target_signal"], 0.0)
+
+    def test_inverse_registry_is_universal_and_extensible(self) -> None:
+        registry = InverseRegistry()
+        spy_links = registry.resolve("spy", available_symbols={"SH", "SDS"})
+        self.assertEqual({link.inverse_symbol for link in spy_links}, {"SH", "SDS"})
+        registry.register(InverseLink("TSLA", "TSLS", -1.0, source="test"))
+        self.assertEqual(registry.resolve("TSLA")[0].inverse_symbol, "TSLS")
+        self.assertEqual(registry.resolve("AAPL", available_symbols={"NOPE"}), ())
+
+    def test_model_combines_multiple_inverse_markets(self) -> None:
+        inverse_chain = chain()
+        inverse_chain["call_bid"] += 0.5
+        inverse_chain["call_ask"] += 0.5
+        result = OptionWaveV09().predict(
+            chain(),
+            MarketState(spot=100.0, realized_vol=0.25, symbol="SPY"),
+            inverse_markets=(
+                InverseMarketData("SH", inverse_chain, MarketState(spot=100.0), -1.0),
+                InverseMarketData("SDS", inverse_chain, MarketState(spot=100.0), -2.0),
+            ),
+            horizons_minutes=(30.0,),
+        )
+        self.assertEqual(result.diagnostics["inverse_count"], 2.0)
+        self.assertEqual(result.diagnostics["inverse_symbols"], "SH,SDS")
+        self.assertLess(float(result.diagnostics["inverse_target_signal"]), 0.0)
+
+    def test_http_snapshot_normalizer_builds_wide_chain(self) -> None:
+        payload = {
+            "results": [
+                {
+                    "details": {"contract_type": "call", "strike_price": 105.0, "expiration_date": "2026-07-25"},
+                    "last_quote": {"bid": 1.9, "ask": 2.1},
+                    "last_trade": {"price": 2.0, "sip_timestamp": 1784980800000000000},
+                    "day": {"volume": 1000},
+                    "open_interest": 5000,
+                    "implied_volatility": 0.25,
+                    "greeks": {"delta": 0.45, "gamma": 0.03},
+                },
+                {
+                    "details": {"contract_type": "put", "strike_price": 95.0, "expiration_date": "2026-07-25"},
+                    "last_quote": {"bid": 0.9, "ask": 1.1},
+                    "last_trade": {"price": 1.0, "sip_timestamp": 1784980800000000000},
+                    "day": {"volume": 800},
+                    "open_interest": 4500,
+                    "implied_volatility": 0.27,
+                    "greeks": {"delta": -0.45, "gamma": 0.03},
+                },
+            ]
+        }
+        normalized = MassiveHTTPClient.normalize_option_snapshots(payload, as_of="2026-07-18")
+        self.assertEqual(len(normalized), 2)
+        self.assertIn("call_bid", normalized)
+        self.assertIn("put_bid", normalized)
+        self.assertEqual(float(normalized.loc[normalized.strike == 105.0, "call_last"].iloc[0]), 2.0)
 
 
 if __name__ == "__main__":

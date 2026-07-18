@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import erf, exp, sqrt
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,7 @@ from .elo import (
     premium_sentiment_elo,
 )
 from .flow import FlowConfig, FlowSummary, aggregate_large_flow
+from .inverse import InverseMarketData
 
 
 @dataclass
@@ -91,7 +93,7 @@ class ModelResult:
     trend_score: float
     direction: str
     confidence: float
-    diagnostics: dict[str, float]
+    diagnostics: dict[str, object]
     flow_summary: FlowSummary | None
     expectations: dict[float, Expectation]
     elo_surface: pd.DataFrame
@@ -230,6 +232,47 @@ class OptionWaveV09:
         target_signal = float(np.sign(inverse_beta) * native_signal) if inverse_beta != 0 else 0.0
         return float(np.clip(native_signal, -1.0, 1.0)), float(np.clip(target_signal, -1.0, 1.0)), confidence
 
+    def _inverse_observations(
+        self,
+        markets: Sequence[InverseMarketData],
+    ) -> tuple[float, float, float, tuple[str, ...]]:
+        """Combine independently observed inverse products.
+
+        Each product is first scored in its own native direction and only then
+        mapped by its explicit beta.  This prevents SQQQ, PSQ, SH, or a
+        single-stock inverse ETP from being mixed into the target option chain.
+        """
+
+        native_values: list[float] = []
+        target_values: list[float] = []
+        confidences: list[float] = []
+        symbols: list[str] = []
+        for market in markets:
+            if market.state is None or not isinstance(market.state, MarketState):
+                continue
+            try:
+                native, target, confidence = self._inverse_observation(
+                    market.chain if isinstance(market.chain, pd.DataFrame) else None,
+                    market.state,
+                    market.beta,
+                )
+            except (ValueError, RuntimeError):
+                # A vendor can return a partial or stale chain for one
+                # companion product.  Do not discard the target forecast.
+                continue
+            effective_confidence = float(np.clip(confidence * market.confidence, 0.0, 1.0))
+            if effective_confidence <= 0.0:
+                continue
+            native_values.append(native)
+            target_values.append(target)
+            confidences.append(effective_confidence)
+            symbols.append(market.symbol.upper())
+        if not confidences:
+            return 0.0, 0.0, 0.0, tuple()
+        native_signal, _ = _combine_indicators(native_values, confidences)
+        target_signal, confidence = _combine_indicators(target_values, confidences)
+        return native_signal, target_signal, confidence, tuple(symbols)
+
     def predict(
         self,
         chain: pd.DataFrame,
@@ -241,6 +284,7 @@ class OptionWaveV09:
         inverse_chain: pd.DataFrame | None = None,
         inverse_state: MarketState | None = None,
         inverse_beta: float | None = None,
+        inverse_markets: Sequence[InverseMarketData] | None = None,
     ) -> ModelResult:
         """Update the ELO surface and return integrated expectations.
 
@@ -273,11 +317,15 @@ class OptionWaveV09:
         down_cost = float(asymmetric_cost(median_distance, "down", self.config.elo))
 
         flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
-        inverse_native_signal, inverse_target_signal, inverse_confidence = self._inverse_observation(
-            inverse_chain,
-            inverse_state,
-            self.config.inverse.beta if inverse_beta is None else float(inverse_beta),
-        )
+        inverse_inputs: list[InverseMarketData] = list(inverse_markets or ())
+        if inverse_chain is not None or inverse_state is not None:
+            inverse_inputs.insert(0, InverseMarketData(
+                symbol=(inverse_state.symbol if inverse_state is not None and inverse_state.symbol else "INVERSE"),
+                chain=inverse_chain,
+                state=inverse_state,
+                beta=self.config.inverse.beta if inverse_beta is None else float(inverse_beta),
+            ))
+        inverse_native_signal, inverse_target_signal, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
         indicator_values = [current_signal, premium_signal, energy_signal]
         indicator_confidences = [mean_confidence, mean_confidence, mean_confidence]
         if flow_summary is not None and flow_summary.gross_notional > 0.0:
@@ -381,6 +429,8 @@ class OptionWaveV09:
             "inverse_native_signal": float(inverse_native_signal),
             "inverse_target_signal": float(inverse_target_signal),
             "inverse_confidence": float(inverse_confidence),
+            "inverse_count": float(len(inverse_symbols)),
+            "inverse_symbols": ",".join(inverse_symbols),
             "mean_pair_variance": float(mean_variance),
             "mean_pair_confidence": float(mean_confidence),
             "upward_cost_at_median_distance": up_cost,

@@ -188,20 +188,24 @@ large trade is one whose absolute notional exceeds the configured threshold.
 The source diagnostics include total signal, large-trade signal, net notional,
 and recent-minus-prior flow velocity.
 
-## 9. Inverse-instrument link
+## 9. Universal inverse-instrument links
 
-An inverse instrument can be supplied as another normalized option chain. Its
-native signal \(s_{\mathrm{inv}}\) is mapped to the target by the exposure sign:
+Every explicitly registered inverse product is supplied as an independent
+normalized option chain. Its native signal \(s_{\mathrm{inv},k}\) is mapped to
+the target by its exposure sign:
 
 \[
-s_{\mathrm{target,inv}}=\operatorname{sign}(\beta_{\mathrm{inv}})\,s_{\mathrm{inv}}
+s_{\mathrm{target,inv},k}=\operatorname{sign}(\beta_k)\,s_{\mathrm{inv},k}
 \]
 
-For QQQ, SQQQ is modeled with \(\beta_{\mathrm{inv}}=-3\) for daily direction;
-the leverage changes the instrument's exposure, while the sign maps its
-direction back to QQQ. This is a confirmation input, not a claim that the
-ETF is a perfect long-horizon inverse because daily reset and tracking error
-remain.
+If several products are available, their mapped signals are combined with
+their observed data confidence, not with a hard-coded ticker preference. The
+registry can represent `SPY -> SH/SDS`, `QQQ -> PSQ/QID/SQQQ`, `DIA -> DOG`,
+`IWM -> RWM`, and provider-confirmed single-stock ETPs such as `TSLA -> TSLS`.
+The leverage changes the instrument's exposure, while the sign maps its
+direction back to the target. This is a same-session confirmation input, not a
+claim that an inverse ETF is a perfect long-horizon inverse because daily
+reset, compounding, fees, and tracking error remain.
 
 ## 10. Confidence-weighted composite
 
