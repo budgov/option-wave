@@ -1,27 +1,17 @@
-You are working on the Option Wave Forecast Model v0.8 (ELO First).
+You are working on Option Wave Forecast Model v0.9.
 
-Goals:
-1. Inspect the existing Python package.
-2. Add data adapters for moomoo OpenD and Schwab/thinkorswim CSV/API market data.
-3. Implement robust option-chain normalization.
-4. Compute the v0.8 research factors:
-   - PremiumSentiment_ELO
-   - EnergySignal
-   - EnergyVelocity
-   - EnergyAcceleration
-   - WhaleImpact_adj
-   - OIConfirm
-   - HedgePressure
-   - GEXSignal
-   - GammaWallSignal
-   - SkewSignal
-   - TermSignal
-   - IVRankSignal
-   - StockConfirm
-   - penalty terms: WallPressure, CloseDecay, MomentumDivergence, FlowDecay
-   - boost term: BreakoutBoost
-5. Add tests using synthetic option chains.
-6. Add chart outputs for factor contributions and forecast paths.
-7. Keep this as a research and analytics package only. Do not add any order execution or account-action code.
+The implementation must preserve this pipeline:
 
-Prioritize correctness, traceability, and clear factor-level debugging.
+1. Pair `+d Call` with `-d Put` at the same expiry. For spot 100, `105C`
+   pairs with `95P`; never compare only the same strike.
+2. Apply asymmetric movement costs so upside is harder than downside.
+3. Use quote spread or explicit variance to shrink noisy pair observations.
+4. Update the online ELO state for every expiry and distance pair.
+5. Evolve the paired surface with the vectorized continuous PDE.
+6. Integrate the score over time and return expected price, return, variance,
+   and probability of an upward move.
+
+Keep the implementation research-only: no order execution, account actions,
+or guessed whale-flow data. Prefer NumPy vectorization and small tensors over
+large data-frame transformations. Run `python -m unittest discover -s tests`
+and the sample before handing off changes.

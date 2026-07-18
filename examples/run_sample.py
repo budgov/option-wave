@@ -2,56 +2,54 @@ from __future__ import annotations
 
 import pandas as pd
 
-from option_wave import OptionWaveV08
-from option_wave.factors import MarketState
-from option_wave.charts import plot_contributions
+from option_wave import MarketState, OptionWaveV09
 
 
 def make_sample_chain() -> pd.DataFrame:
-    strikes = [717, 718, 719, 720, 721, 722, 723, 724, 725]
+    """Create two symmetric strike ladders for same-day and future expiry."""
+
+    spot = 100.0
+    strikes = [90, 95, 100, 105, 110]
     rows = []
-    for k in strikes:
-        rows.append({
-            "strike": k,
-            "expiry_days": 0,
-            "call_bid": max(0.05, 721.5 - k) + 0.35,
-            "call_ask": max(0.08, 721.5 - k) + 0.45,
-            "call_last": max(0.06, 721.5 - k) + 0.40,
-            "put_bid": max(0.05, k - 721.5) + 0.35,
-            "put_ask": max(0.08, k - 721.5) + 0.45,
-            "put_last": max(0.06, k - 721.5) + 0.40,
-            "call_volume": 1000 + max(0, k - 720) * 300,
-            "put_volume": 900 + max(0, 721 - k) * 350,
-            "call_oi": 5000,
-            "put_oi": 5000,
-            "call_delta": max(0.05, min(0.95, 0.5 - (k-721.5)*0.08)),
-            "put_delta": -max(0.05, min(0.95, 0.5 + (k-721.5)*0.08)),
-        })
+    for expiry_days in (0, 1, 7):
+        for strike in strikes:
+            distance = abs(strike - spot) / spot
+            time_value = 0.55 + 0.08 * (expiry_days + 1) ** 0.5
+            rows.append({
+                "strike": strike,
+                "expiry_days": expiry_days,
+                "call_bid": max(0.05, spot - strike) / 100 + time_value,
+                "call_ask": max(0.08, spot - strike) / 100 + time_value + 0.04,
+                "put_bid": max(0.05, strike - spot) / 100 + time_value * (1.0 + distance),
+                "put_ask": max(0.08, strike - spot) / 100 + time_value * (1.0 + distance) + 0.04,
+                "call_volume": 1000 + 100 * expiry_days,
+                "put_volume": 900 + 160 * expiry_days,
+                "call_oi": 5000,
+                "put_oi": 5000,
+                "call_iv": 0.24 + expiry_days * 0.005,
+                "put_iv": 0.25 + expiry_days * 0.005,
+            })
     return pd.DataFrame(rows)
 
 
 def main() -> None:
-    chain = make_sample_chain()
-    model = OptionWaveV08()
-    state = MarketState(
-        spot=721.5,
-        high=725.0,
-        low=717.18,
-        vwap=721.8,
-        rvol=1.2,
-        stock_dollar_volume=721.5 * 10_000_000,
-        minutes_from_open=180,
+    model = OptionWaveV09()
+    result = model.predict(
+        make_sample_chain(),
+        MarketState(spot=100.0, high=102.0, low=97.0, realized_vol=0.25),
     )
-    result = model.predict(chain, state, k_wall=722.0, whale_impact=0.0, whale_confidence=0.0)
     print(f"TrendScore: {result.trend_score:+.3f}")
     print(f"Direction: {result.direction}")
     print(f"Confidence: {result.confidence:.2f}")
-    print("Factors:")
-    for k, v in result.factors.items():
-        print(f"  {k}: {v:+.4f}")
-
-    plot_contributions(result.contributions, "Option Wave v0.8 sample factor contributions", "sample_contributions.png")
-    print("Saved chart: sample_contributions.png")
+    print("Expectations:")
+    for horizon, expectation in result.expectations.items():
+        print(
+            f"  {horizon:>4.0f}m: price={expectation.expected_price:.3f}, "
+            f"return={expectation.expected_return:+.3%}, "
+            f"P(up)={expectation.probability_up:.2%}"
+        )
+    print("Pair check:")
+    print(result.elo_surface[["expiry_days", "distance_pct", "call_strike", "put_strike", "elo_signal"]].head(8).to_string(index=False))
 
 
 if __name__ == "__main__":
