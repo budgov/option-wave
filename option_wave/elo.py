@@ -17,6 +17,8 @@ from typing import MutableMapping
 import numpy as np
 import pandas as pd
 
+from ._backend import HAS_CPP_CORE, cpp_core
+
 EPS = 1e-12
 RatingState = MutableMapping[tuple[str, float, float], float]
 
@@ -121,7 +123,7 @@ def _side_values(frame: pd.DataFrame, side: str, cfg: EloConfig) -> dict[str, np
     }
 
 
-def build_symmetric_pairs(
+def _build_symmetric_pairs_python(
     chain: pd.DataFrame,
     spot: float,
     cfg: EloConfig | None = None,
@@ -219,6 +221,66 @@ def build_symmetric_pairs(
     return pd.concat(rows, ignore_index=True)
 
 
+_PAIR_COLUMNS = (
+    "expiry_days", "distance_pct", "call_strike", "put_strike", "call_price", "put_price",
+    "call_force", "put_force", "call_variance", "put_variance", "pair_variance", "confidence",
+    "raw_score", "effective_score", "pair_weight", "call_volume", "put_volume", "call_oi",
+    "put_oi", "call_delta", "put_delta",
+)
+
+
+def _build_symmetric_pairs_cpp(chain: pd.DataFrame, spot: float, cfg: EloConfig) -> pd.DataFrame:
+    frame = chain.copy()
+    frame["strike"] = pd.to_numeric(frame["strike"], errors="coerce")
+    frame = frame.dropna(subset=["strike"])
+    expiry = _expiry_column(frame)
+    call = _side_values(frame, "call", cfg)
+    put = _side_values(frame, "put", cfg)
+    arrays = [
+        np.ascontiguousarray(frame["strike"].to_numpy(float)),
+        np.ascontiguousarray(expiry),
+        np.ascontiguousarray(call["price"]),
+        np.ascontiguousarray(put["price"]),
+        np.ascontiguousarray(call["variance"]),
+        np.ascontiguousarray(put["variance"]),
+        np.ascontiguousarray(call["volume"]),
+        np.ascontiguousarray(put["volume"]),
+        np.ascontiguousarray(call["oi"]),
+        np.ascontiguousarray(put["oi"]),
+        np.ascontiguousarray(call["delta"]),
+        np.ascontiguousarray(put["delta"]),
+    ]
+    result = cpp_core.build_pairs(
+        *arrays,
+        float(spot),
+        float(cfg.min_distance),
+        float(cfg.distance_exponent),
+        float(cfg.up_difficulty),
+        float(cfg.down_difficulty),
+        float(cfg.variance_floor),
+        float(cfg.variance_scale),
+        float(cfg.expiry_decay_days),
+    )
+    return pd.DataFrame({column: np.asarray(result[column], dtype=float) for column in _PAIR_COLUMNS})
+
+
+def build_symmetric_pairs(
+    chain: pd.DataFrame,
+    spot: float,
+    cfg: EloConfig | None = None,
+) -> pd.DataFrame:
+    """Build the pair surface, using C++ when the extension is installed."""
+
+    cfg = cfg or EloConfig()
+    if spot <= 0:
+        raise ValueError("spot must be positive")
+    if "strike" not in chain or chain.empty:
+        raise ValueError("chain must contain at least one strike row")
+    if HAS_CPP_CORE:
+        return _build_symmetric_pairs_cpp(chain, spot, cfg)
+    return _build_symmetric_pairs_python(chain, spot, cfg)
+
+
 def _expected_rating(call_rating: np.ndarray, put_rating: np.ndarray, scale: float) -> np.ndarray:
     exponent = np.clip((put_rating - call_rating) / max(scale, EPS), -50.0, 50.0)
     return 1.0 / (1.0 + np.power(10.0, exponent))
@@ -248,31 +310,61 @@ def build_elo_surface(
     expected = np.empty(len(surface), dtype=float)
     delta_rating = np.empty(len(surface), dtype=float)
 
-    for i, (expiry_days, distance) in enumerate(keys):
-        key_call = ("call", float(expiry_days), float(distance))
-        key_put = ("put", float(expiry_days), float(distance))
-        force_ratio = max(float(surface.at[i, "call_force"]), EPS) / max(float(surface.at[i, "put_force"]), EPS)
-        confidence = float(surface.at[i, "confidence"])
-        if ratings is None or key_call not in ratings:
-            prior_gap = cfg.rating_scale * np.log10(force_ratio) * confidence
-            c_rating = cfg.base_rating + 0.5 * prior_gap
-            p_rating = cfg.base_rating - 0.5 * prior_gap
-        else:
-            c_rating = float(ratings[key_call])
-            p_rating = float(ratings[key_put])
-
-        exp_call = float(_expected_rating(np.array([c_rating]), np.array([p_rating]), cfg.rating_scale)[0])
-        actual = float(surface.at[i, "effective_score"])
-        delta = cfg.k_factor * confidence * (actual - exp_call)
-        c_rating += delta
-        p_rating -= delta
-        call_rating[i] = c_rating
-        put_rating[i] = p_rating
-        expected[i] = exp_call
-        delta_rating[i] = delta
+    if HAS_CPP_CORE:
+        prior_call = np.full(len(surface), np.nan, dtype=float)
+        prior_put = np.full(len(surface), np.nan, dtype=float)
         if ratings is not None:
-            ratings[key_call] = c_rating
-            ratings[key_put] = p_rating
+            for i, (expiry_days, distance) in enumerate(keys):
+                key_call = ("call", float(expiry_days), float(distance))
+                key_put = ("put", float(expiry_days), float(distance))
+                if key_call in ratings and key_put in ratings:
+                    prior_call[i] = ratings[key_call]
+                    prior_put[i] = ratings[key_put]
+        update = cpp_core.update_elo(
+            np.ascontiguousarray(surface["call_force"].to_numpy(float)),
+            np.ascontiguousarray(surface["put_force"].to_numpy(float)),
+            np.ascontiguousarray(surface["effective_score"].to_numpy(float)),
+            np.ascontiguousarray(surface["confidence"].to_numpy(float)),
+            prior_call,
+            prior_put,
+            float(cfg.base_rating),
+            float(cfg.rating_scale),
+            float(cfg.k_factor),
+        )
+        call_rating[:] = np.asarray(update["call_elo"], dtype=float)
+        put_rating[:] = np.asarray(update["put_elo"], dtype=float)
+        expected[:] = np.asarray(update["expected_call_score"], dtype=float)
+        delta_rating[:] = np.asarray(update["elo_delta"], dtype=float)
+        if ratings is not None:
+            for i, (expiry_days, distance) in enumerate(keys):
+                ratings[("call", float(expiry_days), float(distance))] = call_rating[i]
+                ratings[("put", float(expiry_days), float(distance))] = put_rating[i]
+    else:
+        for i, (expiry_days, distance) in enumerate(keys):
+            key_call = ("call", float(expiry_days), float(distance))
+            key_put = ("put", float(expiry_days), float(distance))
+            force_ratio = max(float(surface.at[i, "call_force"]), EPS) / max(float(surface.at[i, "put_force"]), EPS)
+            confidence = float(surface.at[i, "confidence"])
+            if ratings is None or key_call not in ratings:
+                prior_gap = cfg.rating_scale * np.log10(force_ratio) * confidence
+                c_rating = cfg.base_rating + 0.5 * prior_gap
+                p_rating = cfg.base_rating - 0.5 * prior_gap
+            else:
+                c_rating = float(ratings[key_call])
+                p_rating = float(ratings[key_put])
+
+            exp_call = float(_expected_rating(np.array([c_rating]), np.array([p_rating]), cfg.rating_scale)[0])
+            actual = float(surface.at[i, "effective_score"])
+            delta = cfg.k_factor * confidence * (actual - exp_call)
+            c_rating += delta
+            p_rating -= delta
+            call_rating[i] = c_rating
+            put_rating[i] = p_rating
+            expected[i] = exp_call
+            delta_rating[i] = delta
+            if ratings is not None:
+                ratings[key_call] = c_rating
+                ratings[key_put] = p_rating
 
     surface["expected_call_score"] = expected
     surface["elo_delta"] = delta_rating

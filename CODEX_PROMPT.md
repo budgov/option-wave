@@ -12,6 +12,7 @@ The implementation must preserve this pipeline:
    and probability of an upward move.
 
 Keep the implementation research-only: no order execution, account actions,
-or guessed whale-flow data. Prefer NumPy vectorization and small tensors over
-large data-frame transformations. Run `python -m unittest discover -s tests`
-and the sample before handing off changes.
+or guessed whale-flow data. Keep DataFrame handling in Python and put numerical
+hot paths in the C++17 extension. Preserve the Python reference path for
+cross-checking. Run `python -m unittest discover -s tests` and the sample
+after rebuilding with `pip install -e .` before handing off changes.

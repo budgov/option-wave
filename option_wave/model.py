@@ -18,6 +18,7 @@ from math import erf, exp, sqrt
 import numpy as np
 import pandas as pd
 
+from ._backend import HAS_CPP_CORE, cpp_core
 from .elo import (
     EPS,
     EloConfig,
@@ -77,7 +78,7 @@ class ModelResult:
     trend_score: float
     direction: str
     confidence: float
-    factors: dict[str, float]
+    diagnostics: dict[str, float]
     expectations: dict[float, Expectation]
     elo_surface: pd.DataFrame
     distance_grid: np.ndarray
@@ -206,29 +207,55 @@ class OptionWaveV09:
             raise ValueError("horizons_minutes must contain positive values")
         max_horizon = max(horizons)
         dt = max(float(self.config.pde.timestep_minutes), 1e-3)
-        steps = int(np.ceil(max_horizon / dt))
-        times = np.arange(steps + 1, dtype=float) * dt
-        fields = observed.copy()
-        scores = np.empty(steps + 1, dtype=float)
-        scores[0] = current_signal
-        for step in range(1, steps + 1):
-            fields = _advance_pde(fields, observed, distances, expiries, self.config.pde, dt)
-            scores[step] = _weighted_mean(fields.ravel(), grid_weights.ravel())
+        if HAS_CPP_CORE:
+            evolution = cpp_core.evolve_field(
+                np.ascontiguousarray(observed.ravel()),
+                np.ascontiguousarray(grid_weights.ravel()),
+                np.ascontiguousarray(distances),
+                np.ascontiguousarray(expiries),
+                float(self.config.pde.distance_diffusion),
+                float(self.config.pde.expiry_diffusion),
+                float(self.config.pde.distance_drift),
+                float(self.config.pde.decay),
+                float(self.config.pde.source_strength),
+                float(dt),
+                list(horizons),
+            )
+            fields = np.asarray(evolution["field"], dtype=float).reshape(observed.shape)
+            integrated_values = np.asarray(evolution["integrals"], dtype=float)
+            average_values = np.asarray(evolution["averages"], dtype=float)
+        else:
+            steps = int(np.ceil(max_horizon / dt))
+            times = np.arange(steps + 1, dtype=float) * dt
+            fields = observed.copy()
+            scores = np.empty(steps + 1, dtype=float)
+            scores[0] = current_signal
+            for step in range(1, steps + 1):
+                fields = _advance_pde(fields, observed, distances, expiries, self.config.pde, dt)
+                scores[step] = _weighted_mean(fields.ravel(), grid_weights.ravel())
+            integrated_values = []
+            average_values = []
+            trapezoid = getattr(np, "trapezoid", np.trapz)
+            for horizon in horizons:
+                index = min(int(np.ceil(horizon / dt)), steps)
+                local_times = times[: index + 1]
+                local_scores = scores[: index + 1]
+                integrated = float(trapezoid(local_scores, local_times))
+                integrated_values.append(integrated)
+                average_values.append(integrated / max(float(local_times[-1]), EPS))
+            integrated_values = np.asarray(integrated_values, dtype=float)
+            average_values = np.asarray(average_values, dtype=float)
 
         volatility = self._volatility(chain, state)
         expectations: dict[float, Expectation] = {}
-        for horizon in horizons:
-            index = min(int(np.ceil(horizon / dt)), steps)
-            local_times = times[: index + 1]
-            local_scores = scores[: index + 1]
-            trapezoid = getattr(np, "trapezoid", np.trapz)
-            integrated = float(trapezoid(local_scores, local_times))
-            average = integrated / max(float(local_times[-1]), EPS)
+        for horizon, integrated, average in zip(horizons, integrated_values, average_values):
+            integrated = float(integrated)
+            average = float(average)
             # The same signal magnitude produces a larger downside move than
             # upside move because the latter is modeled as harder to achieve.
             asymmetry = self.config.elo.up_difficulty - self.config.elo.down_difficulty
             direction_scale = 1.0 - asymmetry * 0.25 if average >= 0 else 1.0 + asymmetry * 0.25
-            year_fraction = float(local_times[-1]) / self.config.pde.trading_minutes_per_year
+            year_fraction = float(horizon) / self.config.pde.trading_minutes_per_year
             expected_log_return = average * volatility * sqrt(max(year_fraction, 0.0)) * direction_scale
             return_variance = volatility * volatility * max(year_fraction, 0.0) * (1.0 + mean_variance)
             expected_price = state.spot * exp(expected_log_return)
@@ -248,7 +275,7 @@ class OptionWaveV09:
         longest = expectations[max(expectations)]
         trend_score = float(np.tanh(longest.average_signal))
         confidence_score = float(np.clip(0.5 * mean_confidence + 0.5 * abs(trend_score), 0.0, 1.0))
-        factors = {
+        diagnostics = {
             "premium_elo": float(premium_signal),
             "current_field_signal": float(current_signal),
             "energy_signal": energy_signal,
@@ -264,7 +291,7 @@ class OptionWaveV09:
             trend_score=trend_score,
             direction=self._direction(trend_score),
             confidence=confidence_score,
-            factors=factors,
+            diagnostics=diagnostics,
             expectations=expectations,
             elo_surface=surface,
             distance_grid=distances,
@@ -299,8 +326,3 @@ class OptionWaveV09:
         if score < -0.10:
             return "Mild Bearish"
         return "Neutral"
-
-
-# A compatibility alias keeps existing notebooks importable while all logic is
-# now the v0.9 implementation.
-OptionWaveV08 = OptionWaveV09
