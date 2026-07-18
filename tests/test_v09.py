@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from option_wave import MarketState, OptionWaveV09
+from option_wave import MarketState, OptionWaveV09, aggregate_large_flow
 from option_wave.elo import EloConfig, asymmetric_cost, build_symmetric_pairs
 
 
@@ -76,6 +76,77 @@ class OptionWaveV09Tests(unittest.TestCase):
         first_signal = first.elo_surface.elo_signal.to_numpy()
         second_signal = second.elo_surface.elo_signal.to_numpy()
         self.assertFalse(np.allclose(first_signal, second_signal))
+
+    def test_large_flow_tracks_direction_without_price_guessing(self) -> None:
+        flow = pd.DataFrame([
+            {
+                "timestamp": "2026-07-18T14:59:00Z",
+                "right": "C",
+                "aggressor": "buy",
+                "contracts": 10_000,
+                "trade_price": 2.0,
+                "is_opening": True,
+            },
+            {
+                "timestamp": "2026-07-18T14:59:00Z",
+                "right": "P",
+                "aggressor": "buy",
+                "contracts": 5_000,
+                "trade_price": 1.0,
+                "is_opening": True,
+            },
+            {
+                "timestamp": "2026-07-18T14:59:00Z",
+                "right": "C",
+                "contracts": 5_000,
+                "trade_price": 1.0,
+                "is_opening": True,
+            },
+        ])
+        summary = aggregate_large_flow(flow, asof="2026-07-18T15:00:00Z")
+        self.assertEqual(summary.large_trade_count, 1)
+        self.assertGreater(summary.large_net_notional, 0.0)
+        self.assertGreater(summary.large_signal, 0.0)
+        self.assertGreater(summary.confidence, 0.0)
+
+    def test_inverse_index_is_mapped_back_to_target_direction(self) -> None:
+        inverse = chain()
+        inverse["call_bid"] += 0.5
+        inverse["call_ask"] += 0.5
+        result = OptionWaveV09().predict(
+            chain(),
+            MarketState(spot=100.0, realized_vol=0.25),
+            inverse_chain=inverse,
+            inverse_state=MarketState(spot=100.0, realized_vol=0.25),
+            inverse_beta=-1.0,
+            horizons_minutes=(30.0,),
+        )
+        self.assertGreater(result.diagnostics["inverse_native_signal"], 0.0)
+        self.assertGreater(result.diagnostics["inverse_confidence"], 0.0)
+        self.assertLess(result.diagnostics["inverse_target_signal"], 0.0)
+
+    def test_composite_signal_contains_optional_indicators(self) -> None:
+        flow = pd.DataFrame([
+            {
+                "age_minutes": 1.0,
+                "right": "C",
+                "aggressor": "buy",
+                "contracts": 10_000,
+                "trade_price": 2.0,
+                "is_opening": True,
+            },
+        ])
+        result = OptionWaveV09().predict(
+            chain(),
+            MarketState(spot=100.0, realized_vol=0.25),
+            flow=flow,
+            inverse_state=MarketState(spot=100.0, previous_close=99.0, realized_vol=0.25),
+            inverse_beta=-1.0,
+            horizons_minutes=(30.0,),
+        )
+        self.assertIn("composite_signal", result.diagnostics)
+        self.assertGreater(result.diagnostics["large_flow_gross_notional"], 0.0)
+        self.assertNotEqual(result.diagnostics["inverse_target_signal"], 0.0)
 
 
 if __name__ == "__main__":

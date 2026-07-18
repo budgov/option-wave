@@ -317,6 +317,79 @@ py::dict update_elo(
     return result;
 }
 
+py::dict aggregate_flow(
+    const DoubleArray& notional,
+    const DoubleArray& direction,
+    const DoubleArray& confidence,
+    const DoubleArray& age_minutes,
+    const DoubleArray& large_mask,
+    double half_life_minutes
+) {
+    if (notional.size() != direction.size()
+        || notional.size() != confidence.size()
+        || notional.size() != age_minutes.size()
+        || notional.size() != large_mask.size()) {
+        throw std::runtime_error("flow arrays have incompatible lengths");
+    }
+    const auto notional_view = notional.unchecked<1>();
+    const auto direction_view = direction.unchecked<1>();
+    const auto confidence_view = confidence.unchecked<1>();
+    const auto age_view = age_minutes.unchecked<1>();
+    const auto large_view = large_mask.unchecked<1>();
+    const double half_life = std::max(half_life_minutes, 1e-6);
+    const double log_two = std::log(2.0);
+    double net = 0.0;
+    double gross = 0.0;
+    double large_net = 0.0;
+    double large_gross = 0.0;
+    double confidence_mass = 0.0;
+    double recent_net = 0.0;
+    double recent_gross = 0.0;
+    double prior_net = 0.0;
+    double prior_gross = 0.0;
+    double large_count = 0.0;
+    for (ssize_t i = 0; i < notional.size(); ++i) {
+        const double amount = std::max(notional_view(i), 0.0);
+        const double signed_direction = std::max(-1.0, std::min(1.0, direction_view(i)));
+        const double conf = std::max(0.0, std::min(1.0, confidence_view(i)));
+        const double age = std::max(age_view(i), 0.0);
+        const double decay = std::exp(-log_two * age / half_life);
+        const double weighted = amount * conf * decay;
+        const double signed_weighted = weighted * signed_direction;
+        const bool is_large = large_view(i) > 0.0;
+        net += signed_weighted;
+        gross += weighted;
+        confidence_mass += weighted * conf;
+        if (is_large) {
+            large_net += signed_weighted;
+            large_gross += weighted;
+            large_count += 1.0;
+        }
+        if (age <= half_life) {
+            recent_net += signed_weighted;
+            recent_gross += weighted;
+        } else if (age <= 2.0 * half_life) {
+            prior_net += signed_weighted;
+            prior_gross += weighted;
+        }
+    }
+    const double signal = std::tanh(net / std::max(gross, EPS));
+    const double large_signal = std::tanh(large_net / std::max(large_gross, EPS));
+    const double recent_ratio = recent_net / std::max(recent_gross, EPS);
+    const double prior_ratio = prior_net / std::max(prior_gross, EPS);
+    py::dict result;
+    result["net_notional"] = net;
+    result["gross_notional"] = gross;
+    result["large_net_notional"] = large_net;
+    result["large_gross_notional"] = large_gross;
+    result["large_trade_count"] = large_count;
+    result["signal"] = signal;
+    result["large_signal"] = large_signal;
+    result["velocity"] = std::tanh(recent_ratio - prior_ratio);
+    result["confidence"] = confidence_mass / std::max(gross, EPS);
+    return result;
+}
+
 double weighted_mean(const std::vector<double>& values, const std::vector<double>& weights) {
     double numerator = 0.0;
     double denominator = 0.0;
@@ -453,5 +526,6 @@ PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ numerical core for Option Wave v0.9";
     module.def("build_pairs", &build_pairs);
     module.def("update_elo", &update_elo);
+    module.def("aggregate_flow", &aggregate_flow);
     module.def("evolve_field", &evolve_field);
 }

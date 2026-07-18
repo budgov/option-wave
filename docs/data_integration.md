@@ -32,3 +32,38 @@ for audit logs, but should not be silently mixed into the numerical pair key.
 The model's online state is keyed by expiry and relative distance, so call the
 same model instance for sequential snapshots and call `reset()` between
 independent sessions.
+
+## Large-money flow feed
+
+Keep trade-level flow in a separate long-form DataFrame and pass it through the
+`flow=` argument:
+
+```text
+timestamp or age_minutes
+right, aggressor, contracts, trade_price
+bid, ask, is_opening, oi_change, multiplier   # optional
+```
+
+`aggressor` should be an observed buy/sell side. If it is absent, the adapter
+may classify trades at bid/ask with reduced confidence; midpoint or unknown
+trades contribute zero direction. The model computes contract notional,
+time-decay, large-trade threshold, net direction, and recent/prior velocity in
+the compiled backend.
+
+## Inverse feed
+
+For QQQ, provide a separately normalized SQQQ chain and state:
+
+```python
+result = model.predict(
+    qqq_chain,
+    qqq_state,
+    inverse_chain=sqqq_chain,
+    inverse_state=sqqq_state,
+    inverse_beta=-3.0,
+)
+```
+
+The inverse chain is analyzed in its own ELO surface, then mapped to QQQ by
+the sign of its exposure. Do not merge QQQ and SQQQ strikes into one chain.
+The adapter should preserve source timestamps and symbol identifiers for audit.

@@ -160,5 +160,57 @@ expectation, not a guarantee or a calibrated risk-neutral option price.
   probability of an upward move.
 
 The model does not infer whale flow, dealer inventory, or trade aggressor from
-price alone. Those values are deliberately excluded from v0.9 unless a
-verified data adapter supplies them.
+price alone. Verified trade-level large-money flow is now an optional external
+source. Its signed notional is time-decayed in C++, and its confidence is
+reduced when aggressor side, opening status, or OI confirmation is missing.
+
+## 8. Large-money flow source
+
+For trade \(i\), the target-direction sign is
+
+\[
+\delta_i=\begin{cases}
++1 & \text{buy Call or sell Put}\\
+-1 & \text{sell Call or buy Put}\\
+0 & \text{unknown direction}
+\end{cases}
+\]
+
+The decayed notional is
+
+\[
+q_i(t)=100\,N_iP_i\,c_i\,\delta_i\exp(-\ln(2)\,a_i/h)
+\]
+
+where \(N_i\) is contracts, \(P_i\) is trade premium, \(c_i\) is data
+confidence, \(a_i\) is trade age, and \(h\) is the configured half-life. A
+large trade is one whose absolute notional exceeds the configured threshold.
+The source diagnostics include total signal, large-trade signal, net notional,
+and recent-minus-prior flow velocity.
+
+## 9. Inverse-instrument link
+
+An inverse instrument can be supplied as another normalized option chain. Its
+native signal \(s_{\mathrm{inv}}\) is mapped to the target by the exposure sign:
+
+\[
+s_{\mathrm{target,inv}}=\operatorname{sign}(\beta_{\mathrm{inv}})\,s_{\mathrm{inv}}
+\]
+
+For QQQ, SQQQ is modeled with \(\beta_{\mathrm{inv}}=-3\) for daily direction;
+the leverage changes the instrument's exposure, while the sign maps its
+direction back to QQQ. This is a confirmation input, not a claim that the
+ETF is a perfect long-horizon inverse because daily reset and tracking error
+remain.
+
+## 10. Confidence-weighted composite
+
+Available signals are combined by observed confidence:
+
+\[
+s_{\mathrm{comp}}=\frac{\sum_j c_j s_j}{\sum_j c_j}
+\]
+
+The composite source shifts the ELO field before PDE evolution. Missing flow or
+inverse data contributes zero weight, so the model does not manufacture a
+whale or inverse signal when the adapter has not supplied one.

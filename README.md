@@ -68,15 +68,57 @@ keeps the online ELO state; call `reset()` to start a fresh session.
 
 Recommended sources are moomoo OpenD/OpenAPI and the Schwab Developer API.
 They should feed the normalized schema above. Live whale-flow data is not a
-required input in v0.9: if it cannot be verified, it is intentionally omitted
-instead of guessed.
+required input in v0.9: when supplied, it must be trade-level data with an
+observable aggressor side or bid/ask placement. Unknown direction is ignored,
+not guessed from the underlying price.
+
+### Large-money flow
+
+The optional flow table accepts `timestamp` (or `age_minutes`), `right`,
+`aggressor`, `contracts`, and `trade_price`. Optional fields include
+`bid`, `ask`, `is_opening`, `oi_change`, and `multiplier`. The C++ backend
+applies notional sizing, confidence, half-life decay, large-trade threshold,
+and recent-versus-prior velocity. Example:
+
+```python
+result = model.predict(
+    chain,
+    MarketState(spot=100.0, symbol="QQQ"),
+    flow=flow_trades,
+    flow_asof="2026-07-18T15:00:00Z",
+)
+print(result.diagnostics["large_flow_notional"])
+print(result.diagnostics["flow_velocity"])
+```
+
+### Inverse index confirmation
+
+Pass a corresponding inverse option chain and state when available. For QQQ,
+SQQQ is a daily approximately `-3x` exposure, so set `inverse_beta=-3.0`;
+the inverse signal is mapped back to QQQ direction before entering the
+confidence-weighted composite source field:
+
+```python
+result = model.predict(
+    qqq_chain,
+    MarketState(spot=720.0, symbol="QQQ"),
+    inverse_chain=sqqq_chain,
+    inverse_state=MarketState(spot=sqqq_spot, symbol="SQQQ"),
+    inverse_beta=-3.0,
+)
+```
+
+The composite signal uses confidence—not fixed hand-tuned factor weights—to
+combine the ELO field, premium/energy confirmation, verified large flow, and
+the inverse instrument. The diagnostics expose each component for audit.
 
 ## Performance design
 
 `pip install -e .` builds the C++17 extension in `cpp/option_wave_core.cpp`.
 It owns pair construction/interpolation, variance-aware ELO updates, and PDE
-time stepping. Python remains at the boundary for DataFrame normalization,
-online rating-key management, charting, and result objects. A small Python
+time stepping, plus time-decayed large-flow aggregation. Python remains at the
+boundary for DataFrame normalization, online rating-key management, charting,
+and result objects. A small Python
 reference path remains only as a portability/debug fallback when the extension
 has not been built.
 

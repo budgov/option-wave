@@ -26,6 +26,7 @@ from .elo import (
     build_elo_surface,
     premium_sentiment_elo,
 )
+from .flow import FlowConfig, FlowSummary, aggregate_large_flow
 
 
 @dataclass
@@ -38,6 +39,8 @@ class MarketState:
     realized_vol: float | None = None
     minutes_from_open: float = 0.0
     minutes_to_close_total: float = 390.0
+    symbol: str | None = None
+    previous_close: float | None = None
 
 
 @dataclass
@@ -55,9 +58,19 @@ class PDEConfig:
 
 
 @dataclass
+class InverseConfig:
+    """Link an inverse or leveraged inverse instrument to the target."""
+
+    beta: float = -1.0
+    minimum_confidence: float = 0.25
+
+
+@dataclass
 class ModelConfig:
     elo: EloConfig = field(default_factory=EloConfig)
     pde: PDEConfig = field(default_factory=PDEConfig)
+    flow: FlowConfig = field(default_factory=FlowConfig)
+    inverse: InverseConfig = field(default_factory=InverseConfig)
     forecast_horizons_minutes: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0)
 
 
@@ -79,6 +92,7 @@ class ModelResult:
     direction: str
     confidence: float
     diagnostics: dict[str, float]
+    flow_summary: FlowSummary | None
     expectations: dict[float, Expectation]
     elo_surface: pd.DataFrame
     distance_grid: np.ndarray
@@ -153,6 +167,20 @@ def _normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + erf(value / sqrt(2.0)))
 
 
+def _combine_indicators(values: list[float], confidences: list[float]) -> tuple[float, float]:
+    """Combine available indicators using confidence as the only weight."""
+
+    value_array = np.asarray(values, dtype=float)
+    confidence_array = np.clip(np.asarray(confidences, dtype=float), 0.0, 1.0)
+    valid = np.isfinite(value_array) & np.isfinite(confidence_array) & (confidence_array > 0.0)
+    if not np.any(valid):
+        return 0.0, 0.0
+    weights = confidence_array[valid]
+    signal = float(np.sum(value_array[valid] * weights) / max(float(np.sum(weights)), EPS))
+    confidence = float(np.sum(weights) / len(weights))
+    return float(np.clip(signal, -1.0, 1.0)), float(np.clip(confidence, 0.0, 1.0))
+
+
 class OptionWaveV09:
     """Fast online implementation of the Option Wave v0.9 model."""
 
@@ -165,12 +193,54 @@ class OptionWaveV09:
 
         self._ratings.clear()
 
+    def _inverse_observation(
+        self,
+        inverse_chain: pd.DataFrame | None,
+        inverse_state: MarketState | None,
+        inverse_beta: float,
+    ) -> tuple[float, float, float]:
+        """Return native inverse signal, target-mapped signal, and confidence."""
+
+        if inverse_state is None or inverse_state.spot <= 0:
+            return 0.0, 0.0, 0.0
+        native_signal = 0.0
+        confidence = 0.0
+        if inverse_chain is not None and not inverse_chain.empty:
+            inverse_surface = build_elo_surface(inverse_chain, inverse_state.spot, self.config.elo, {})
+            inverse_price_signal = 2.0 * inverse_surface["effective_score"].to_numpy(float) - 1.0
+            inverse_signal_values = (
+                inverse_surface["confidence"].to_numpy(float) * inverse_surface["elo_signal"].to_numpy(float)
+                + (1.0 - inverse_surface["confidence"].to_numpy(float)) * inverse_price_signal
+            )
+            native_signal = _weighted_mean(
+                inverse_signal_values,
+                inverse_surface["pair_weight"].to_numpy(float),
+            )
+            confidence = _weighted_mean(
+                inverse_surface["confidence"].to_numpy(float),
+                inverse_surface["pair_weight"].to_numpy(float),
+            )
+        elif inverse_state.previous_close is not None and inverse_state.previous_close > 0:
+            inverse_return = np.log(inverse_state.spot / inverse_state.previous_close)
+            scale = max(inverse_state.realized_vol or self.config.pde.default_volatility, 1e-6)
+            native_signal = float(np.tanh(inverse_return / scale))
+            confidence = 0.5
+        else:
+            return 0.0, 0.0, 0.0
+        target_signal = float(np.sign(inverse_beta) * native_signal) if inverse_beta != 0 else 0.0
+        return float(np.clip(native_signal, -1.0, 1.0)), float(np.clip(target_signal, -1.0, 1.0)), confidence
+
     def predict(
         self,
         chain: pd.DataFrame,
         state: MarketState,
         *,
         horizons_minutes: tuple[float, ...] | None = None,
+        flow: pd.DataFrame | None = None,
+        flow_asof: pd.Timestamp | str | None = None,
+        inverse_chain: pd.DataFrame | None = None,
+        inverse_state: MarketState | None = None,
+        inverse_beta: float | None = None,
     ) -> ModelResult:
         """Update the ELO surface and return integrated expectations.
 
@@ -202,6 +272,27 @@ class OptionWaveV09:
         up_cost = float(asymmetric_cost(median_distance, "up", self.config.elo))
         down_cost = float(asymmetric_cost(median_distance, "down", self.config.elo))
 
+        flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
+        inverse_native_signal, inverse_target_signal, inverse_confidence = self._inverse_observation(
+            inverse_chain,
+            inverse_state,
+            self.config.inverse.beta if inverse_beta is None else float(inverse_beta),
+        )
+        indicator_values = [current_signal, premium_signal, energy_signal]
+        indicator_confidences = [mean_confidence, mean_confidence, mean_confidence]
+        if flow_summary is not None and flow_summary.gross_notional > 0.0:
+            flow_signal = flow_summary.large_signal if flow_summary.large_gross_notional > 0.0 else flow_summary.signal
+            indicator_values.append(flow_signal)
+            indicator_confidences.append(flow_summary.confidence)
+        else:
+            flow_signal = 0.0
+        if inverse_confidence >= self.config.inverse.minimum_confidence:
+            indicator_values.append(inverse_target_signal)
+            indicator_confidences.append(inverse_confidence)
+        composite_signal, composite_confidence = _combine_indicators(indicator_values, indicator_confidences)
+        observed = np.clip(observed + (composite_signal - current_signal), -1.0, 1.0)
+        combined_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
+
         horizons = tuple(sorted(set(horizons_minutes or self.config.forecast_horizons_minutes)))
         if not horizons or horizons[0] <= 0:
             raise ValueError("horizons_minutes must contain positive values")
@@ -229,7 +320,7 @@ class OptionWaveV09:
             times = np.arange(steps + 1, dtype=float) * dt
             fields = observed.copy()
             scores = np.empty(steps + 1, dtype=float)
-            scores[0] = current_signal
+            scores[0] = combined_signal
             for step in range(1, steps + 1):
                 fields = _advance_pde(fields, observed, distances, expiries, self.config.pde, dt)
                 scores[step] = _weighted_mean(fields.ravel(), grid_weights.ravel())
@@ -274,11 +365,22 @@ class OptionWaveV09:
 
         longest = expectations[max(expectations)]
         trend_score = float(np.tanh(longest.average_signal))
-        confidence_score = float(np.clip(0.5 * mean_confidence + 0.5 * abs(trend_score), 0.0, 1.0))
+        confidence_score = float(np.clip(0.5 * composite_confidence + 0.5 * abs(trend_score), 0.0, 1.0))
         diagnostics = {
             "premium_elo": float(premium_signal),
             "current_field_signal": float(current_signal),
+            "composite_signal": float(composite_signal),
+            "composite_confidence": float(composite_confidence),
             "energy_signal": energy_signal,
+            "flow_signal": float(flow_signal),
+            "flow_velocity": float(flow_summary.velocity if flow_summary is not None else 0.0),
+            "large_flow_notional": float(flow_summary.large_net_notional if flow_summary is not None else 0.0),
+            "large_flow_gross_notional": float(flow_summary.large_gross_notional if flow_summary is not None else 0.0),
+            "large_flow_count": float(flow_summary.large_trade_count if flow_summary is not None else 0),
+            "large_flow_confidence": float(flow_summary.confidence if flow_summary is not None else 0.0),
+            "inverse_native_signal": float(inverse_native_signal),
+            "inverse_target_signal": float(inverse_target_signal),
+            "inverse_confidence": float(inverse_confidence),
             "mean_pair_variance": float(mean_variance),
             "mean_pair_confidence": float(mean_confidence),
             "upward_cost_at_median_distance": up_cost,
@@ -292,6 +394,7 @@ class OptionWaveV09:
             direction=self._direction(trend_score),
             confidence=confidence_score,
             diagnostics=diagnostics,
+            flow_summary=flow_summary,
             expectations=expectations,
             elo_surface=surface,
             distance_grid=distances,

@@ -14,5 +14,10 @@ The implementation must preserve this pipeline:
 Keep the implementation research-only: no order execution, account actions,
 or guessed whale-flow data. Keep DataFrame handling in Python and put numerical
 hot paths in the C++17 extension. Preserve the Python reference path for
-cross-checking. Run `python -m unittest discover -s tests` and the sample
-after rebuilding with `pip install -e .` before handing off changes.
+cross-checking. Large-money flow must come from verified trade-level input;
+unknown aggressor direction is zero signal. Inverse instruments may be passed
+as a second chain/state (for QQQ use SQQQ with daily beta -3), and must be
+mapped back by exposure sign. Combine optional indicators by observed
+confidence rather than hard-coded factor weights. Run `python -m unittest
+discover -s tests` and the sample after rebuilding with `pip install -e .`
+before handing off changes.
