@@ -1,220 +1,336 @@
-# Option Wave Forecast Model v0.9
+# Ocean Wave mathematical specification
 
-## 1. Symmetric pair space
+## 1. State domain and symmetric contracts
 
-For spot \(S_t\), define the positive relative distance \(d\). A pair is
+Let spot be \(S_t\), relative distance \(d\ge 0\), time to expiry \(\tau\),
+and market time \(t\). Each expiry is paired independently:
 
 \[
-K_c=S_t(1+d), \qquad K_p=S_t(1-d)
+K_c=S_t(1+d),\qquad K_p=S_t(1-d).
 \]
 
-so `+5% Call` is always compared with `-5% Put` at the same expiry. Prices
-that are not quoted exactly at \(K_c\) or \(K_p\) are linearly interpolated
-within that expiry. No expiry is mixed with another during pairing.
+Thus a `+5% Call` competes with a `-5% Put`; different expiries are never
+mixed during interpolation.
 
-## 2. Non-symmetric movement difficulty
-
-The model treats an upside move as harder than a downside move through costs,
-not through an arbitrary post-hoc sign flip:
+Upside and downside movement resistance is dynamic:
 
 \[
-U(d)=d^{p}\exp(a_u d), \qquad D(d)=d^{p}\exp(a_d d)
+R_u(d,t)=d^p\exp(a_u(t)d),\qquad
+R_d(d,t)=d^p\exp(a_d(t)d),\qquad a_u(t)>a_d(t),
 \]
 
-with \(a_u>a_d\). Therefore \(U(d)>D(d)\) for \(d>0\). The two
-energy-equalized premiums are
-
 \[
-F_c=\frac{C(K_c,\tau,t)}{U(d)+\epsilon}, \qquad
-F_p=\frac{P(K_p,\tau,t)}{D(d)+\epsilon}
+\begin{aligned}
+a_u(t)&=a_{u0}+0.55z_{skew}^++0.25(1-L_t)+0.20z_{short}^+,\\
+a_d(t)&=a_{d0}-0.55z_{skew}^+-0.35(1-L_t)-0.20z_{short}^+.
+\end{aligned}
 \]
 
-The equalized price score is
+The equalized premium forces are
 
 \[
-s=\frac{F_c}{F_c+F_p+\epsilon}
+F_c=\frac{C(K_c,\tau,t)}{R_u(d,t)+\epsilon},\qquad
+F_p=\frac{P(K_p,\tau,t)}{R_d(d,t)+\epsilon},
 \]
 
-This prevents a raw `2.00 Call` versus `1.00 Put` comparison from assuming
-that equal percentage moves require equal market energy.
+and the observed Call score is \(s=F_c/(F_c+F_p+\epsilon)\).
 
-## 3. Variance-aware observation
+## 2. Variance-aware ELO field
 
-For a quoted side, the default relative variance is estimated from its spread:
+Relative quote variance is estimated from bid/ask unless an explicit variance
+is supplied:
 
 \[
-v_c=\left(\frac{Ask_c-Bid_c}{2Mid_c}\right)^2+v_{c,\mathrm{explicit}}
+v_c=\left(\frac{Ask_c-Bid_c}{2Mid_c}\right)^2+v_{c,explicit},\qquad
+v_{pair}=v_c+v_p.
 \]
 
-and likewise for the put. Pair variance and confidence are
+Confidence and the shrunk observation are
 
 \[
-v_{pair}=v_c+v_p, \qquad
-q=\frac{1}{1+v_{pair}/v_0}
+q=\frac{1}{1+v_{pair}/v_0},\qquad
+s_v=\frac12+q\left(s-\frac12\right).
 \]
 
-The observed score is shrunk toward an uncertain 50/50 result:
+For ratings \(R_c,R_p\),
 
 \[
-s_v=\frac12+q\left(s-\frac12\right)
+e_c=\frac{1}{1+10^{(R_p-R_c)/400}},\quad
+\Delta R=Kq(s_v-e_c),
 \]
 
-Wide or stale quotes therefore move the rating less than tight quotes.
-
-## 4. ELO update
-
-Each \((\tau,d,\mathrm{side})\) node has an online rating \(R\). The expected
-Call result against its paired Put is
-
 \[
-e_c=\frac{1}{1+10^{(R_p-R_c)/400}}
+R_c'=R_c+\Delta R,\qquad R_p'=R_p-\Delta R,
 \]
 
-and the variance-aware update is
+and the bounded local field is
 
 \[
-\Delta R=K q(s_v-e_c),
-\qquad R_c'=R_c+\Delta R,
-\qquad R_p'=R_p-\Delta R
+\psi_{ELO}(d,\tau,t)=\tanh\left(\frac{R_c-R_p}{400}\right).
 \]
 
-The rating state is keyed by expiry and relative distance, so repeated market
-snapshots update the same pair instead of recreating a fresh model. The
-bounded pair field is
+## 3. IV surface as a weighted matrix regression
+
+With log-moneyness \(k=\log(K/S_t)\), the executable surface fit is
 
 \[
-\psi_{d,\tau}=\tanh\left(\frac{R_c-R_p}{400}\right)
+\sigma(k,\tau)=\beta_0+\beta_1k+\beta_2k^2+\beta_3\sqrt{\tau}+\varepsilon,
 \]
 
-For the PDE source, an uncertain pair retains some direct premium information:
-
 \[
-\psi_0=q\psi_{d,\tau}+(1-q)(2s_v-1)
+\boxed{\beta=(X^TWX+\lambda I)^{-1}X^TW\boldsymbol\sigma}.
 \]
 
-The surface sentiment is the pair-weighted average of \(\psi\), with expiry
-decay and quote activity included in the integration weight.
-
-## 5. Continuous field equation
-
-The observed ELO surface is the source field \(\psi_0(d,\tau)\). Its
-semi-discrete LUNA evolution is
+Here \(W\) combines distance, expiry, quote liquidity, and activity. The
+engine retains level, moneyness slope, curvature, and time slope. Directional
+IV pressure compares weighted OTM Call and Put IV:
 
 \[
+f_{IV}=\tanh\left(\frac{\overline\sigma_{call,OTM}-\overline\sigma_{put,OTM}}{0.05}\right).
+\]
+
+The volatility risk premium
+
+\[
+VRP_t=\sigma_{ATM,t}-\sigma_{realized,t}
+\]
+
+is a risk/variance modifier, not a forced directional vote.
+
+## 4. Energy, OI, GEX, and dealer hedge
+
+Liquidity-adjusted option energy is integrated over the chain:
+
+\[
+\mathcal E_c=\iint 100\,C\,V_c\,|\Delta_c|\,
+e^{-|\log(K/S)|/b}e^{-\tau/T}\,dK\,d\tau,
+\]
+
+with the same definition for \(\mathcal E_p\). Its bounded direction is
+
+\[
+f_E=\tanh\left(\frac{\mathcal E_c-\mathcal E_p}{\mathcal E_c+\mathcal E_p+\epsilon}\right).
+\]
+
+When OI changes are available,
+
+\[
+f_{OI}=\tanh\left(
+\frac{\iint |\Delta_c|\,dOI_c-\iint |\Delta_p|\,dOI_p}
+{\iint |\Delta_c|\,|dOI_c|+\iint |\Delta_p|\,|dOI_p|+\epsilon}
+\right).
+\]
+
+Otherwise the OI level is used with deliberately lower confidence.
+
+Structural gamma exposure is
+
+\[
+GEX_t=100S_t^2\iint\left(OI_c|\Gamma_c|-OI_p|\Gamma_p|\right)W\,dK\,d\tau.
+\]
+
+Because public chains do not reveal dealer inventory sign, this is treated as
+a regime estimate. Verified trade flow supplies a stronger hedge observation:
+
+\[
+dH_i=100N_i|\Delta_i|\delta_i,
+\qquad
+dG_i=100N_i|\Gamma_i|S_t^2\delta_i,
+\]
+
+where \(\delta_i=+1\) for buy Call/sell Put, \(-1\) for sell Call/buy Put,
+and zero when aggressor direction is unknown.
+
+## 5. Institutional flow integral
+
+For premium \(P_i\), contracts \(N_i\), confidence \(c_i\), age \(a_i\),
+and half-life \(h\), decayed signed notional is
+
+\[
+q_i(t)=100N_iP_i c_i\delta_i e^{-\ln(2)a_i/h}.
+\]
+
+The large-flow signal and velocity are
+
+\[
+f_W=\tanh\left(\frac{\sum_{i\in Whale}q_i}{\sum_{i\in Whale}|q_i|+\epsilon}\right),
+\]
+
+\[
+v_W=\tanh\left(\frac{Q_{recent}}{|Q_{recent}|}-\frac{Q_{prior}}{|Q_{prior}|}\right).
+\]
+
+Unknown trade direction has zero confidence; it is never guessed from stock
+price behavior.
+
+## 6. Short pressure and squeeze interaction
+
+Normalized short observations are mapped into bounded features \(z_j\): short
+interest/float, change in short interest, short-volume ratio, borrow fee,
+utilization, and days to cover. Their internal pressure is
+
+\[
+p_s=\frac{\sum_j\rho_jz_j}{\sum_j\rho_j}.
+\]
+
+The directional factor includes an interaction with positive stock
+confirmation \(f_S\):
+
+\[
+f_{short}=\operatorname{clip}\left(-p_s+1.6[p_s]^+[f_S]^+,-1,1\right).
+\]
+
+High short pressure is bearish until positive price confirmation creates a
+squeeze regime.
+
+For an explicitly registered inverse product with daily beta \(\beta_k<0\),
+the native bounded signal is direction-mapped and leverage-normalized:
+
+\[
+f_{inverse,k}=\operatorname{sign}(\beta_k)\tanh\left(
+\frac{\operatorname{atanh}(s_{inverse,k})}{\max(|\beta_k|,1)}
+\right).
+\]
+
+Several available inverse products are combined by observed data confidence.
+
+## 7. Factor vector and structural priors
+
+The directional state is
+
+\[
+\mathbf f_t=
+\begin{bmatrix}
+f_{ELO}&f_W&f_H&f_{IV}&f_{short}&f_{OI}&f_S&f_{inverse}&f_E
+\end{bmatrix}^T.
+\]
+
+The prior importance vector is
+
+\[
+\boldsymbol\pi=
+\begin{bmatrix}
+.22&.16&.14&.12&.10&.09&.08&.05&.04
+\end{bmatrix}^T.
+\]
+
+Each factor also has observed confidence \(q_i\in[0,1]\). Missing evidence has
+\(q_i=0\), so it cannot influence the result.
+
+## 8. Online covariance and adaptive matrix weights
+
+The online mean and covariance use continuous EWMA updates:
+
+\[
+\boldsymbol\mu_t=(1-\alpha)\boldsymbol\mu_{t-1}+\alpha\mathbf f_t,
+\]
+
+\[
+\boldsymbol\Sigma_t=(1-\alpha)\boldsymbol\Sigma_{t-1}
++\alpha(\mathbf f_t-\boldsymbol\mu_{t-1})(\mathbf f_t-\boldsymbol\mu_t)^T.
+\]
+
+The non-negative ridge-GLS projection is
+
+\[
+\widetilde{\mathbf w}_t=
+\left[(\boldsymbol\Sigma_t+\lambda I)^{-1}
+(\boldsymbol\pi\odot\mathbf q_t)\right]_+,
+\qquad
+\mathbf w_t=\frac{\widetilde{\mathbf w}_t}
+{\mathbf 1^T\widetilde{\mathbf w}_t}.
+\]
+
+The global directional source and its factor uncertainty are
+
+\[
+z_t=\mathbf w_t^T\mathbf f_t,qquad
+V_{factor,t}=\mathbf w_t^T\boldsymbol\Sigma_t\mathbf w_t.
+\]
+
+This preserves the requested importance order as a prior while reducing
+correlated or unstable factors at runtime.
+
+## 9. Continuous Ocean Wave PDE and matrix form
+
+The ELO topology and global projection are coupled with the basis
+
+\[
+b(d,\tau)=e^{-|d|/0.08}e^{-\tau/45},qquad
+u_t=\psi_{ELO}+b(d,\tau)(z_t-\bar\psi_{ELO}).
+\]
+
+The field evolves as
+
+\[
+\boxed{
 \frac{\partial\psi}{\partial t}
 =-v_d\frac{\partial\psi}{\partial d}
-+D_d\frac{\partial^2\psi}{\partial d^2}
-+D_\tau\frac{\partial^2\psi}{\partial\tau^2}
--\lambda\psi+\kappa(\psi_0-\psi)
++D_d(t)\frac{\partial^2\psi}{\partial d^2}
++D_\tau(t)\frac{\partial^2\psi}{\partial\tau^2}
+-\lambda(t)\psi+\kappa(t)(u_t-\psi)
+}.
 \]
 
-The first derivative transports the field, the second derivatives diffuse it,
-\(\lambda\) is decay, and \(\kappa(\psi_0-\psi)\) is the live quote source/sink
-term. The implementation solves this equation with explicit vectorized finite
-differences at a configurable minute step.
+Negative GEX increases source amplification; positive GEX damps it. Wide
+spreads and VRP stress increase diffusion/forecast variance.
 
-## 6. Time integration and expectation
-
-For a horizon \(H\), the model integrates the weighted field score:
+After finite-difference discretization of \((d,\tau)\),
 
 \[
-I_H=\int_0^H\bar\psi(t)\,dt,
-\qquad
-\bar\psi_H=\frac{I_H}{H}
+\dot{\mathbf x}_t=A_t\mathbf x_t+B_t\mathbf f_t+\boldsymbol\varepsilon_t,
 \]
 
-Let \(\sigma\) be realized volatility when supplied, otherwise the median IV
-in the chain, otherwise the configured fallback. With \(Y=252\cdot390\)
-trading minutes per year, the directional expected log return is
+and the implemented explicit step is
 
 \[
-\mu_H=\bar\psi_H\sigma\sqrt{\frac{H}{Y}}\,g(\bar\psi_H)
+\boxed{\mathbf x_{n+1}=(I+\Delta t A_t)\mathbf x_n+\Delta t B_t\mathbf f_t}.
 \]
 
-where \(g\) slightly reduces positive moves and increases negative moves when
-upside difficulty exceeds downside difficulty. Return variance is
+The C++ kernel operates directly on contiguous arrays and integrates all
+requested horizons in one pass.
+
+## 10. Time integral and complete expectation
+
+For integration weight \(W(d,\tau)\),
 
 \[
-V_H=\sigma^2\frac{H}{Y}(1+\bar v_{pair})
+\bar\psi(t)=\frac{\iint\psi(d,\tau,t)W(d,\tau)\,dd\,d\tau}
+{\iint W(d,\tau)\,dd\,d\tau},
 \]
-
-The final outputs are
 
 \[
-E[S_H]=S_t e^{\mu_H},\qquad
-P(S_H>S_t)=\Phi\left(\frac{\mu_H}{\sqrt{V_H}}\right)
+I_H=\int_0^H\bar\psi(t)dt,qquad \bar\psi_H=I_H/H.
 \]
 
-and a lognormal price variance derived from \(V_H\). This is an analytical
-expectation, not a guarantee or a calibrated risk-neutral option price.
-
-## 7. Output contract
-
-`ModelResult` returns:
-
-- current `trend_score`, `direction`, and data-aware `confidence`;
-- the paired ELO surface for auditability;
-- the PDE field tensor for 3D visualization;
-- one `Expectation` per requested horizon containing integrated signal,
-  expected return, expected price, return variance, price variance, and
-  probability of an upward move.
-
-The model does not infer whale flow, dealer inventory, or trade aggressor from
-price alone. Verified trade-level large-money flow is now an optional external
-source. Its signed notional is time-decayed in C++, and its confidence is
-reduced when aggressor side, opening status, or OI confirmation is missing.
-
-## 8. Large-money flow source
-
-For trade \(i\), the target-direction sign is
+Expected log return is
 
 \[
-\delta_i=\begin{cases}
-+1 & \text{buy Call or sell Put}\\
--1 & \text{sell Call or buy Put}\\
-0 & \text{unknown direction}
-\end{cases}
+\mu_H=\bar\psi_H\sigma\sqrt{H/Y}\,g_\pm(t)\,a_\Gamma(t),
 \]
 
-The decayed notional is
+where \(g_+<g_-\) implements harder upside/easier downside and \(a_\Gamma\)
+is the GEX regime multiplier. Forecast variance is
 
 \[
-q_i(t)=100\,N_iP_i\,c_i\,\delta_i\exp(-\ln(2)\,a_i/h)
+V_H=\sigma^2\frac{H}{Y}\left[
+1+\bar v_{pair}+V_{factor,t}+(1-L_t)+c_{VRP}|VRP_t|
+\right].
 \]
 
-where \(N_i\) is contracts, \(P_i\) is trade premium, \(c_i\) is data
-confidence, \(a_i\) is trade age, and \(h\) is the configured half-life. A
-large trade is one whose absolute notional exceeds the configured threshold.
-The source diagnostics include total signal, large-trade signal, net notional,
-and recent-minus-prior flow velocity.
-
-## 9. Universal inverse-instrument links
-
-Every explicitly registered inverse product is supplied as an independent
-normalized option chain. Its native signal \(s_{\mathrm{inv},k}\) is mapped to
-the target by its exposure sign:
+Under \(\log(S_H/S_t)\sim N(\mu_H,V_H)\), the complete outputs are
 
 \[
-s_{\mathrm{target,inv},k}=\operatorname{sign}(\beta_k)\,s_{\mathrm{inv},k}
+\boxed{E[S_H]=S_t\exp(\mu_H+\tfrac12V_H)},
 \]
-
-If several products are available, their mapped signals are combined with
-their observed data confidence, not with a hard-coded ticker preference. The
-registry can represent `SPY -> SH/SDS`, `QQQ -> PSQ/QID/SQQQ`, `DIA -> DOG`,
-`IWM -> RWM`, and provider-confirmed single-stock ETPs such as `TSLA -> TSLS`.
-The leverage changes the instrument's exposure, while the sign maps its
-direction back to the target. This is a same-session confirmation input, not a
-claim that an inverse ETF is a perfect long-horizon inverse because daily
-reset, compounding, fees, and tracking error remain.
-
-## 10. Confidence-weighted composite
-
-Available signals are combined by observed confidence:
 
 \[
-s_{\mathrm{comp}}=\frac{\sum_j c_j s_j}{\sum_j c_j}
+\boxed{P(S_H>S_t)=\Phi\left(\frac{\mu_H}{\sqrt{V_H}}\right)},
 \]
 
-The composite source shifts the ELO field before PDE evolution. Missing flow or
-inverse data contributes zero weight, so the model does not manufacture a
-whale or inverse signal when the adapter has not supplied one.
+\[
+\boxed{\operatorname{Var}(S_H)=E[S_H]^2(e^{V_H}-1)}.
+\]
+
+These are model expectations conditioned on supplied data, not guarantees or
+arbitrage-free option prices.

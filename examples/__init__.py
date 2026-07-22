@@ -1,1 +1,1 @@
-"""Runnable examples for Option Wave v0.9."""
+"""Runnable examples for Ocean Wave."""

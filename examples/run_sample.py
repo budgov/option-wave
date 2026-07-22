@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from option_wave import MarketState, OptionWaveV09
+from option_wave import MarketState, OceanWave, ShortData
 
 
 def make_sample_chain() -> pd.DataFrame:
@@ -28,15 +28,32 @@ def make_sample_chain() -> pd.DataFrame:
                 "put_oi": 5000,
                 "call_iv": 0.24 + expiry_days * 0.005,
                 "put_iv": 0.25 + expiry_days * 0.005,
+                "call_delta": 0.50,
+                "put_delta": -0.50,
+                "call_gamma": 0.02,
+                "put_gamma": 0.02,
+                "call_vega": 0.10,
+                "put_vega": 0.10,
             })
     return pd.DataFrame(rows)
 
 
 def main() -> None:
-    model = OptionWaveV09()
+    model = OceanWave()
     result = model.predict(
         make_sample_chain(),
-        MarketState(spot=100.0, high=102.0, low=97.0, realized_vol=0.25),
+        MarketState(
+            spot=100.0,
+            high=102.0,
+            low=97.0,
+            vwap=99.8,
+            previous_close=99.5,
+            return_5m=0.001,
+            return_15m=0.002,
+            rvol=1.2,
+            realized_vol=0.25,
+        ),
+        short_data=ShortData(short_interest_ratio=0.08, short_volume_ratio=0.48, days_to_cover=1.7),
     )
     print(f"TrendScore: {result.trend_score:+.3f}")
     print(f"Direction: {result.direction}")
@@ -50,6 +67,8 @@ def main() -> None:
         )
     print("Pair check:")
     print(result.elo_surface[["expiry_days", "distance_pct", "call_strike", "put_strike", "elo_signal"]].head(8).to_string(index=False))
+    print("Dynamic factor weights:")
+    print(result.factor_table[["factor", "signal", "confidence", "dynamic_weight", "contribution"]].to_string(index=False))
 
 
 if __name__ == "__main__":

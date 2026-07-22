@@ -1,31 +1,31 @@
-You are working on Option Wave Forecast Model v0.9.
+You are working on Ocean Wave, a research-only financial-engineering model.
 
-The implementation must preserve this pipeline:
+Preserve these invariants:
 
-1. Pair `+d Call` with `-d Put` at the same expiry. For spot 100, `105C`
-   pairs with `95P`; never compare only the same strike.
-2. Apply asymmetric movement costs so upside is harder than downside.
-3. Use quote spread or explicit variance to shrink noisy pair observations.
-4. Update the online ELO state for every expiry and distance pair.
-5. Evolve the paired surface with the vectorized continuous PDE.
-6. Integrate the score over time and return expected price, return, variance,
-   and probability of an upward move.
+1. Pair `+d Call` with `-d Put` at the same expiry; never replace this with a
+   same-strike Call/Put comparison.
+2. Keep upside/downside resistance asymmetric and dynamically dependent on IV
+   skew, liquidity, and short pressure.
+3. Treat symmetric premium ELO as one factor—not the whole model.
+4. Keep verified institutional flow, dealer hedge pressure, IV surface, short
+   pressure, OI positioning, stock confirmation, inverse products, and option
+   energy in the factor vector.
+5. Preserve the published factor priors, but let observed confidence and the
+   online covariance matrix determine runtime weights.
+6. Keep GEX, VRP, quote liquidity, and factor covariance as risk/PDE modifiers
+   rather than arbitrary directional votes.
+7. Evolve the strike-expiry field with the PDE and integrate it over time to
+   produce expected price, return, variance, and probability.
 
-Keep the implementation research-only: no order execution, account actions,
-or guessed whale-flow data. Keep DataFrame handling in Python and put numerical
-hot paths in the C++17 extension. Preserve the Python reference path for
-cross-checking. Large-money flow must come from verified trade-level input;
-unknown aggressor direction is zero signal. Live data must use HTTPS APIs only;
-do not add moomoo/OpenD or any desktop-broker dependency. Normalize provider
-JSON at the Python/HTTP boundary, keep API credentials in runtime secrets, and
-feed the numerical engine only normalized data.
+Numerical hot paths belong in the C++17 extension: pairing/interpolation, ELO,
+IV weighted least squares, OI/GEX/energy extraction, flow risk, covariance
+weighting, and PDE integration. Python is the HTTPS/API and object boundary.
+Keep the reference path for portability and numerical cross-checks.
 
-Resolve every provider-confirmed inverse product through `InverseRegistry`.
-Examples include `SPY -> SH/SDS`, `QQQ -> PSQ/QID/SQQQ`, `DIA -> DOG`,
-`IWM -> RWM`, and single-stock mappings such as `TSLA -> TSLS` when listed by
-the provider. Never infer an inverse ticker from its name or correlation.
-Fetch each inverse chain/state independently, pass them as
-`inverse_markets=...`, and map each signal by its explicit negative daily beta.
-Combine optional indicators by observed confidence rather than hard-coded
-factor weights. Run `python -m unittest discover -s tests` and the sample after
-rebuilding with `pip install -e .` before handing off changes.
+Never guess whale direction, dealer inventory, short data, or inverse products.
+Unknown evidence gets zero confidence. Live data must use online HTTPS or
+WebSocket APIs; do not add moomoo/OpenD or desktop-broker dependencies. API
+credentials belong in runtime secrets.
+
+Run the complete unit suite, sample, and benchmark after rebuilding the C++
+extension. Do not add order execution or account actions.

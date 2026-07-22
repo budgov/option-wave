@@ -1,4 +1,4 @@
-"""Vectorized symmetric Call/Put ELO surface for Option Wave v0.9.
+"""Vectorized symmetric Call/Put ELO surface for Ocean Wave.
 
 The important unit is a *distance pair*, not a shared strike:
 

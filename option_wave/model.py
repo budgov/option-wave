@@ -1,18 +1,15 @@
-"""Option Wave v0.9: symmetric ELO + variance-aware continuous field.
+"""Ocean Wave: C++ accelerated option-surface forecasting.
 
-The model deliberately has one path from quotes to output:
-
-    paired premiums -> variance-aware ELO surface -> PDE evolution
-    -> time integral -> expected return/price distribution
-
-There are no independent hand-tuned factor weights in this version.  Quote
-activity and expiry enter as integration weights; uncertainty contracts the
-pair signal before it reaches the field.
+The model combines a symmetric premium-ELO surface with verified institutional
+flow, dealer hedging, IV geometry, short pressure, OI changes, stock
+confirmation, inverse instruments, and liquidity-adjusted energy.  Factor
+priors are reweighted online by an EWMA covariance matrix before a continuous
+PDE is integrated over each forecast horizon.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import erf, exp, sqrt
 from typing import Sequence
 
@@ -20,12 +17,17 @@ import numpy as np
 import pandas as pd
 
 from ._backend import HAS_CPP_CORE, cpp_core
-from .elo import (
-    EPS,
-    EloConfig,
-    asymmetric_cost,
-    build_elo_surface,
-    premium_sentiment_elo,
+from .elo import EPS, EloConfig, asymmetric_cost, build_elo_surface, premium_sentiment_elo
+from .factors import (
+    ChainFactorSummary,
+    FactorBlend,
+    FactorConfig,
+    FactorState,
+    ShortData,
+    adaptive_blend,
+    extract_chain_factors,
+    short_pressure,
+    stock_confirmation,
 )
 from .flow import FlowConfig, FlowSummary, aggregate_large_flow
 from .inverse import InverseMarketData
@@ -43,11 +45,16 @@ class MarketState:
     minutes_to_close_total: float = 390.0
     symbol: str | None = None
     previous_close: float | None = None
+    return_5m: float | None = None
+    return_15m: float | None = None
+    stock_volume: float | None = None
+    stock_dollar_volume: float | None = None
+    data_confidence: float = 1.0
 
 
 @dataclass
 class PDEConfig:
-    """Stable, intentionally small coefficients for the semi-discrete PDE."""
+    """Coefficients for the semi-discrete advection-diffusion-reaction PDE."""
 
     distance_diffusion: float = 0.015
     expiry_diffusion: float = 0.010
@@ -57,12 +64,14 @@ class PDEConfig:
     timestep_minutes: float = 1.0
     default_volatility: float = 0.25
     trading_minutes_per_year: float = 252.0 * 390.0
+    negative_gamma_amplifier: float = 0.35
+    positive_gamma_dampener: float = 0.20
+    liquidity_diffusion_penalty: float = 0.50
+    vrp_variance_scale: float = 1.50
 
 
 @dataclass
 class InverseConfig:
-    """Link an inverse or leveraged inverse instrument to the target."""
-
     beta: float = -1.0
     minimum_confidence: float = 0.25
 
@@ -70,6 +79,7 @@ class InverseConfig:
 @dataclass
 class ModelConfig:
     elo: EloConfig = field(default_factory=EloConfig)
+    factors: FactorConfig = field(default_factory=FactorConfig)
     pde: PDEConfig = field(default_factory=PDEConfig)
     flow: FlowConfig = field(default_factory=FlowConfig)
     inverse: InverseConfig = field(default_factory=InverseConfig)
@@ -94,6 +104,9 @@ class ModelResult:
     direction: str
     confidence: float
     diagnostics: dict[str, object]
+    factor_table: pd.DataFrame
+    factor_covariance: np.ndarray
+    chain_factors: ChainFactorSummary
     flow_summary: FlowSummary | None
     expectations: dict[float, Expectation]
     elo_surface: pd.DataFrame
@@ -103,10 +116,7 @@ class ModelResult:
 
     @property
     def expected_price(self) -> float:
-        """Return the longest configured horizon's expected price."""
-
-        horizon = max(self.expectations)
-        return self.expectations[horizon].expected_price
+        return self.expectations[max(self.expectations)].expected_price
 
 
 def _numeric_column(frame: pd.DataFrame, name: str, default: float = 0.0) -> np.ndarray:
@@ -116,84 +126,78 @@ def _numeric_column(frame: pd.DataFrame, name: str, default: float = 0.0) -> np.
 
 
 def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    denominator = float(np.sum(np.maximum(weights, EPS)))
-    return float(np.sum(values * np.maximum(weights, EPS)) / denominator)
+    positive = np.maximum(np.asarray(weights, dtype=float), EPS)
+    return float(np.sum(np.asarray(values, dtype=float) * positive) / np.sum(positive))
 
 
-def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Pack a pair table into a compact expiry x distance tensor."""
-
-    distances = np.sort(surface["distance_pct"].unique().astype(float))
-    expiries = np.sort(surface["expiry_days"].unique().astype(float))
-    field = np.zeros((len(expiries), len(distances)), dtype=float)
-    weights = np.zeros_like(field)
-    expiry_index = np.searchsorted(expiries, surface["expiry_days"].to_numpy(float))
-    distance_index = np.searchsorted(distances, surface["distance_pct"].to_numpy(float))
-    field[expiry_index, distance_index] = surface["pair_signal"].to_numpy(float)
-    weights[expiry_index, distance_index] = surface["pair_weight"].to_numpy(float)
-    return distances, expiries, field, weights
-
-
-def _gradient_and_laplacian(field: np.ndarray, coordinates: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
-    if len(coordinates) < 2:
-        zeros = np.zeros_like(field)
-        return zeros, zeros
-    gradient = np.gradient(field, coordinates, axis=axis, edge_order=1)
-    laplacian = np.gradient(gradient, coordinates, axis=axis, edge_order=1)
-    return gradient, laplacian
-
-
-def _advance_pde(
-    field: np.ndarray,
-    observed: np.ndarray,
-    distances: np.ndarray,
-    expiries: np.ndarray,
-    cfg: PDEConfig,
-    dt_minutes: float,
-) -> np.ndarray:
-    """One explicit, vectorized PDE step with source, diffusion, and decay."""
-
-    grad_d, lap_d = _gradient_and_laplacian(field, distances, axis=1)
-    _, lap_tau = _gradient_and_laplacian(field, expiries, axis=0)
-    derivative = (
-        -cfg.distance_drift * grad_d
-        + cfg.distance_diffusion * lap_d
-        + cfg.expiry_diffusion * lap_tau
-        - cfg.decay * field
-        + cfg.source_strength * (observed - field)
-    )
-    return np.clip(field + dt_minutes * derivative, -1.0, 1.0)
-
-
-def _normal_cdf(value: float) -> float:
-    return 0.5 * (1.0 + erf(value / sqrt(2.0)))
-
-
-def _combine_indicators(values: list[float], confidences: list[float]) -> tuple[float, float]:
-    """Combine available indicators using confidence as the only weight."""
-
+def _combine_indicators(values: Sequence[float], confidences: Sequence[float]) -> tuple[float, float]:
     value_array = np.asarray(values, dtype=float)
     confidence_array = np.clip(np.asarray(confidences, dtype=float), 0.0, 1.0)
     valid = np.isfinite(value_array) & np.isfinite(confidence_array) & (confidence_array > 0.0)
     if not np.any(valid):
         return 0.0, 0.0
     weights = confidence_array[valid]
-    signal = float(np.sum(value_array[valid] * weights) / max(float(np.sum(weights)), EPS))
-    confidence = float(np.sum(weights) / len(weights))
-    return float(np.clip(signal, -1.0, 1.0)), float(np.clip(confidence, 0.0, 1.0))
+    return (
+        float(np.clip(np.average(value_array[valid], weights=weights), -1.0, 1.0)),
+        float(np.clip(weights.mean(), 0.0, 1.0)),
+    )
 
 
-class OptionWaveV09:
-    """Fast online implementation of the Option Wave v0.9 model."""
+def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    distances = np.sort(surface["distance_pct"].unique().astype(float))
+    expiries = np.sort(surface["expiry_days"].unique().astype(float))
+    field_grid = np.zeros((len(expiries), len(distances)), dtype=float)
+    weight_grid = np.zeros_like(field_grid)
+    expiry_index = np.searchsorted(expiries, surface["expiry_days"].to_numpy(float))
+    distance_index = np.searchsorted(distances, surface["distance_pct"].to_numpy(float))
+    field_grid[expiry_index, distance_index] = surface["pair_signal"].to_numpy(float)
+    weight_grid[expiry_index, distance_index] = surface["pair_weight"].to_numpy(float)
+    return distances, expiries, field_grid, weight_grid
+
+
+def _gradient_and_laplacian(field_grid: np.ndarray, coordinates: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
+    if len(coordinates) < 2:
+        zeros = np.zeros_like(field_grid)
+        return zeros, zeros
+    gradient = np.gradient(field_grid, coordinates, axis=axis, edge_order=1)
+    return gradient, np.gradient(gradient, coordinates, axis=axis, edge_order=1)
+
+
+def _advance_pde(
+    field_grid: np.ndarray,
+    observed: np.ndarray,
+    distances: np.ndarray,
+    expiries: np.ndarray,
+    config: PDEConfig,
+    timestep: float,
+) -> np.ndarray:
+    gradient_distance, laplacian_distance = _gradient_and_laplacian(field_grid, distances, axis=1)
+    _, laplacian_expiry = _gradient_and_laplacian(field_grid, expiries, axis=0)
+    derivative = (
+        -config.distance_drift * gradient_distance
+        + config.distance_diffusion * laplacian_distance
+        + config.expiry_diffusion * laplacian_expiry
+        - config.decay * field_grid
+        + config.source_strength * (observed - field_grid)
+    )
+    return np.clip(field_grid + timestep * derivative, -1.0, 1.0)
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + erf(value / sqrt(2.0)))
+
+
+class OceanWave:
+    """Online Ocean Wave model with C++ numerical kernels."""
 
     def __init__(self, config: ModelConfig | None = None) -> None:
         self.config = config or ModelConfig()
         self._ratings: dict[tuple[str, float, float], float] = {}
+        self._factor_state = FactorState.create(self.config.factors)
 
     def reset(self) -> None:
-        """Clear online ELO memory while keeping numerical configuration."""
-
         self._ratings.clear()
+        self._factor_state = FactorState.create(self.config.factors)
 
     def _inverse_observation(
         self,
@@ -201,48 +205,33 @@ class OptionWaveV09:
         inverse_state: MarketState | None,
         inverse_beta: float,
     ) -> tuple[float, float, float]:
-        """Return native inverse signal, target-mapped signal, and confidence."""
-
-        if inverse_state is None or inverse_state.spot <= 0:
+        if inverse_state is None or inverse_state.spot <= 0.0:
             return 0.0, 0.0, 0.0
-        native_signal = 0.0
-        confidence = 0.0
         if inverse_chain is not None and not inverse_chain.empty:
             inverse_surface = build_elo_surface(inverse_chain, inverse_state.spot, self.config.elo, {})
-            inverse_price_signal = 2.0 * inverse_surface["effective_score"].to_numpy(float) - 1.0
-            inverse_signal_values = (
-                inverse_surface["confidence"].to_numpy(float) * inverse_surface["elo_signal"].to_numpy(float)
-                + (1.0 - inverse_surface["confidence"].to_numpy(float)) * inverse_price_signal
-            )
-            native_signal = _weighted_mean(
-                inverse_signal_values,
-                inverse_surface["pair_weight"].to_numpy(float),
-            )
-            confidence = _weighted_mean(
-                inverse_surface["confidence"].to_numpy(float),
-                inverse_surface["pair_weight"].to_numpy(float),
-            )
-        elif inverse_state.previous_close is not None and inverse_state.previous_close > 0:
+            price_signal = 2.0 * inverse_surface["effective_score"].to_numpy(float) - 1.0
+            confidence = inverse_surface["confidence"].to_numpy(float)
+            pair_signal = confidence * inverse_surface["elo_signal"].to_numpy(float) + (1.0 - confidence) * price_signal
+            native = _weighted_mean(pair_signal, inverse_surface["pair_weight"].to_numpy(float))
+            quality = _weighted_mean(confidence, inverse_surface["pair_weight"].to_numpy(float))
+        elif inverse_state.previous_close is not None and inverse_state.previous_close > 0.0:
             inverse_return = np.log(inverse_state.spot / inverse_state.previous_close)
             scale = max(inverse_state.realized_vol or self.config.pde.default_volatility, 1e-6)
-            native_signal = float(np.tanh(inverse_return / scale))
-            confidence = 0.5
+            native = float(np.tanh(inverse_return / scale))
+            quality = 0.5
         else:
             return 0.0, 0.0, 0.0
-        target_signal = float(np.sign(inverse_beta) * native_signal) if inverse_beta != 0 else 0.0
-        return float(np.clip(native_signal, -1.0, 1.0)), float(np.clip(target_signal, -1.0, 1.0)), confidence
+        if inverse_beta != 0.0:
+            bounded = float(np.clip(native, -0.999999, 0.999999))
+            target = float(np.sign(inverse_beta) * np.tanh(np.arctanh(bounded) / max(abs(inverse_beta), 1.0)))
+        else:
+            target = 0.0
+        return float(np.clip(native, -1.0, 1.0)), float(np.clip(target, -1.0, 1.0)), float(quality)
 
     def _inverse_observations(
         self,
         markets: Sequence[InverseMarketData],
     ) -> tuple[float, float, float, tuple[str, ...]]:
-        """Combine independently observed inverse products.
-
-        Each product is first scored in its own native direction and only then
-        mapped by its explicit beta.  This prevents SQQQ, PSQ, SH, or a
-        single-stock inverse ETP from being mixed into the target option chain.
-        """
-
         native_values: list[float] = []
         target_values: list[float] = []
         confidences: list[float] = []
@@ -257,15 +246,13 @@ class OptionWaveV09:
                     market.beta,
                 )
             except (ValueError, RuntimeError):
-                # A vendor can return a partial or stale chain for one
-                # companion product.  Do not discard the target forecast.
                 continue
-            effective_confidence = float(np.clip(confidence * market.confidence, 0.0, 1.0))
-            if effective_confidence <= 0.0:
+            confidence = float(np.clip(confidence * market.confidence, 0.0, 1.0))
+            if confidence <= 0.0:
                 continue
             native_values.append(native)
             target_values.append(target)
-            confidences.append(effective_confidence)
+            confidences.append(confidence)
             symbols.append(market.symbol.upper())
         if not confidences:
             return 0.0, 0.0, 0.0, tuple()
@@ -273,12 +260,116 @@ class OptionWaveV09:
         target_signal, confidence = _combine_indicators(target_values, confidences)
         return native_signal, target_signal, confidence, tuple(symbols)
 
+    def _dynamic_elo_config(self, chain_summary: ChainFactorSummary, short_factor_pressure: float) -> EloConfig:
+        skew_stress = float(np.clip(max(chain_summary.iv_skew, 0.0) / 0.10, 0.0, 1.5))
+        liquidity_stress = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
+        short_stress = float(np.clip(max(short_factor_pressure, 0.0), 0.0, 1.0))
+        return replace(
+            self.config.elo,
+            up_difficulty=self.config.elo.up_difficulty + 0.55 * skew_stress + 0.25 * liquidity_stress + 0.20 * short_stress,
+            down_difficulty=self.config.elo.down_difficulty - 0.55 * skew_stress - 0.35 * liquidity_stress - 0.20 * short_stress,
+        )
+
+    def _dynamic_pde_config(self, chain_summary: ChainFactorSummary) -> tuple[PDEConfig, float]:
+        base = self.config.pde
+        negative_gamma = max(-chain_summary.gex_balance, 0.0)
+        positive_gamma = max(chain_summary.gex_balance, 0.0)
+        gamma_multiplier = max(
+            0.50,
+            1.0 + base.negative_gamma_amplifier * negative_gamma - base.positive_gamma_dampener * positive_gamma,
+        )
+        illiquidity = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
+        vrp_stress = min(abs(chain_summary.volatility_risk_premium), 0.50)
+        return replace(
+            base,
+            distance_diffusion=base.distance_diffusion * (1.0 + base.liquidity_diffusion_penalty * illiquidity + vrp_stress),
+            expiry_diffusion=base.expiry_diffusion * (1.0 + 0.50 * vrp_stress),
+            decay=base.decay * (1.0 + 0.25 * positive_gamma - 0.20 * negative_gamma),
+            source_strength=base.source_strength * gamma_multiplier,
+        ), gamma_multiplier
+
+    def _factor_observations(
+        self,
+        surface: pd.DataFrame,
+        chain_summary: ChainFactorSummary,
+        state: MarketState,
+        short_data: ShortData | None,
+        flow_summary: FlowSummary | None,
+        inverse_target_signal: float,
+        inverse_confidence: float,
+    ) -> tuple[list[float], list[float], dict[str, float]]:
+        premium_signal = premium_sentiment_elo(surface)
+        mean_pair_confidence = _weighted_mean(surface["confidence"].to_numpy(float), surface["pair_weight"].to_numpy(float))
+        liquidity = float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
+        premium_confidence = mean_pair_confidence * (0.40 + 0.60 * liquidity)
+
+        if flow_summary is not None and flow_summary.gross_notional > 0.0:
+            primary_flow = flow_summary.large_signal if flow_summary.large_gross_notional > 0.0 else flow_summary.signal
+            flow_signal = float(np.tanh(0.75 * primary_flow + 0.25 * flow_summary.velocity))
+            flow_confidence = flow_summary.confidence * (1.0 if flow_summary.large_gross_notional > 0.0 else 0.75)
+        else:
+            flow_signal = 0.0
+            flow_confidence = 0.0
+
+        dealer_values: list[float] = []
+        dealer_confidences: list[float] = []
+        if flow_summary is not None and flow_summary.greek_coverage > 0.0:
+            dealer_values.append(flow_summary.hedge_signal)
+            dealer_confidences.append(flow_summary.confidence * flow_summary.greek_coverage)
+        if chain_summary.gex_confidence > 0.0:
+            structural = chain_summary.energy_signal * (1.0 - 0.50 * chain_summary.gex_balance)
+            dealer_values.append(float(np.clip(structural, -1.0, 1.0)))
+            dealer_confidences.append(0.50 * chain_summary.gex_confidence * chain_summary.energy_confidence)
+        dealer_signal, dealer_confidence = _combine_indicators(dealer_values, dealer_confidences)
+
+        stock_signal, stock_confidence = stock_confirmation(state)
+        short_factor = short_pressure(short_data, stock_signal)
+        values = [
+            premium_signal,
+            flow_signal,
+            dealer_signal,
+            chain_summary.iv_surface_signal,
+            short_factor.signal,
+            chain_summary.oi_signal,
+            stock_signal,
+            inverse_target_signal,
+            chain_summary.energy_signal,
+        ]
+        confidences = [
+            premium_confidence,
+            flow_confidence,
+            dealer_confidence,
+            chain_summary.iv_confidence,
+            short_factor.confidence,
+            chain_summary.oi_confidence,
+            stock_confidence,
+            inverse_confidence if inverse_confidence >= self.config.inverse.minimum_confidence else 0.0,
+            chain_summary.energy_confidence,
+        ]
+        details = {
+            "premium_signal": premium_signal,
+            "premium_confidence": premium_confidence,
+            "flow_signal": flow_signal,
+            "flow_confidence": flow_confidence,
+            "dealer_signal": dealer_signal,
+            "dealer_confidence": dealer_confidence,
+            "stock_signal": stock_signal,
+            "stock_confidence": stock_confidence,
+            "short_signal": short_factor.signal,
+            "short_confidence": short_factor.confidence,
+            "short_pressure": short_factor.pressure,
+            "short_squeeze": short_factor.squeeze,
+        }
+        return values, confidences, details
+
     def predict(
         self,
         chain: pd.DataFrame,
         state: MarketState,
         *,
         horizons_minutes: tuple[float, ...] | None = None,
+        previous_chain: pd.DataFrame | None = None,
+        short_data: ShortData | None = None,
         flow: pd.DataFrame | None = None,
         flow_asof: pd.Timestamp | str | None = None,
         inverse_chain: pd.DataFrame | None = None,
@@ -286,35 +377,25 @@ class OptionWaveV09:
         inverse_beta: float | None = None,
         inverse_markets: Sequence[InverseMarketData] | None = None,
     ) -> ModelResult:
-        """Update the ELO surface and return integrated expectations.
+        """Calculate the Ocean Wave field and integrated price expectations."""
 
-        ``chain`` is expected in the wide format used by ``build_elo_surface``:
-        one row per strike/expiry, with ``call_*`` and ``put_*`` quote fields.
-        """
-
-        if state.spot <= 0:
+        if state.spot <= 0.0:
             raise ValueError("state.spot must be positive")
-        surface = build_elo_surface(chain, state.spot, self.config.elo, self._ratings)
-
-        # Variance makes the current quote useful without allowing noisy pairs
-        # to dominate the online ELO state.
+        chain_summary = extract_chain_factors(
+            chain,
+            state.spot,
+            realized_vol=state.realized_vol,
+            previous_chain=previous_chain,
+        )
+        preliminary_stock, _ = stock_confirmation(state)
+        preliminary_short = short_pressure(short_data, preliminary_stock)
+        elo_config = self._dynamic_elo_config(chain_summary, preliminary_short.pressure)
+        surface = build_elo_surface(chain, state.spot, elo_config, self._ratings)
         price_signal = 2.0 * surface["effective_score"].to_numpy(float) - 1.0
-        elo_signal = surface["elo_signal"].to_numpy(float)
-        confidence = surface["confidence"].to_numpy(float)
-        surface["pair_signal"] = confidence * elo_signal + (1.0 - confidence) * price_signal
-
+        pair_confidence = surface["confidence"].to_numpy(float)
+        surface["pair_signal"] = pair_confidence * surface["elo_signal"].to_numpy(float) + (1.0 - pair_confidence) * price_signal
         distances, expiries, observed, grid_weights = _surface_grid(surface)
-        current_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
-        premium_signal = premium_sentiment_elo(surface)
-
-        call_notional = surface["call_price"].to_numpy(float) * surface["call_volume"].to_numpy(float)
-        put_notional = surface["put_price"].to_numpy(float) * surface["put_volume"].to_numpy(float)
-        energy_signal = float((call_notional.sum() - put_notional.sum()) / (call_notional.sum() + put_notional.sum() + EPS))
-        mean_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
-        mean_confidence = _weighted_mean(confidence, surface["pair_weight"].to_numpy(float))
-        median_distance = float(np.median(distances))
-        up_cost = float(asymmetric_cost(median_distance, "up", self.config.elo))
-        down_cost = float(asymmetric_cost(median_distance, "down", self.config.elo))
+        current_field_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
 
         flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
         inverse_inputs: list[InverseMarketData] = list(inverse_markets or ())
@@ -325,144 +406,174 @@ class OptionWaveV09:
                 state=inverse_state,
                 beta=self.config.inverse.beta if inverse_beta is None else float(inverse_beta),
             ))
-        inverse_native_signal, inverse_target_signal, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
-        indicator_values = [current_signal, premium_signal, energy_signal]
-        indicator_confidences = [mean_confidence, mean_confidence, mean_confidence]
-        if flow_summary is not None and flow_summary.gross_notional > 0.0:
-            flow_signal = flow_summary.large_signal if flow_summary.large_gross_notional > 0.0 else flow_summary.signal
-            indicator_values.append(flow_signal)
-            indicator_confidences.append(flow_summary.confidence)
-        else:
-            flow_signal = 0.0
-        if inverse_confidence >= self.config.inverse.minimum_confidence:
-            indicator_values.append(inverse_target_signal)
-            indicator_confidences.append(inverse_confidence)
-        composite_signal, composite_confidence = _combine_indicators(indicator_values, indicator_confidences)
-        observed = np.clip(observed + (composite_signal - current_signal), -1.0, 1.0)
-        combined_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
+        inverse_native, inverse_target, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
+        factor_values, factor_confidences, factor_details = self._factor_observations(
+            surface,
+            chain_summary,
+            state,
+            short_data,
+            flow_summary,
+            inverse_target,
+            inverse_confidence,
+        )
+        blend: FactorBlend = adaptive_blend(factor_values, factor_confidences, self._factor_state, self.config.factors)
+
+        # B maps the global factor projection onto the strike-expiry field while
+        # preserving the ELO surface's local topology.
+        distance_basis = np.exp(-np.abs(distances) / 0.08)
+        expiry_basis = np.exp(-expiries / 45.0)
+        source_basis = expiry_basis[:, None] * distance_basis[None, :]
+        basis_mean = _weighted_mean(source_basis.ravel(), grid_weights.ravel())
+        source_basis /= max(basis_mean, EPS)
+        observed = np.clip(observed + (blend.signal - current_field_signal) * source_basis, -1.0, 1.0)
 
         horizons = tuple(sorted(set(horizons_minutes or self.config.forecast_horizons_minutes)))
-        if not horizons or horizons[0] <= 0:
+        if not horizons or horizons[0] <= 0.0:
             raise ValueError("horizons_minutes must contain positive values")
-        max_horizon = max(horizons)
-        dt = max(float(self.config.pde.timestep_minutes), 1e-3)
+        pde_config, gamma_multiplier = self._dynamic_pde_config(chain_summary)
+        timestep = max(float(pde_config.timestep_minutes), 1e-3)
         if HAS_CPP_CORE:
             evolution = cpp_core.evolve_field(
                 np.ascontiguousarray(observed.ravel()),
                 np.ascontiguousarray(grid_weights.ravel()),
                 np.ascontiguousarray(distances),
                 np.ascontiguousarray(expiries),
-                float(self.config.pde.distance_diffusion),
-                float(self.config.pde.expiry_diffusion),
-                float(self.config.pde.distance_drift),
-                float(self.config.pde.decay),
-                float(self.config.pde.source_strength),
-                float(dt),
+                float(pde_config.distance_diffusion),
+                float(pde_config.expiry_diffusion),
+                float(pde_config.distance_drift),
+                float(pde_config.decay),
+                float(pde_config.source_strength),
+                float(timestep),
                 list(horizons),
             )
-            fields = np.asarray(evolution["field"], dtype=float).reshape(observed.shape)
+            field_grid = np.asarray(evolution["field"], dtype=float).reshape(observed.shape)
             integrated_values = np.asarray(evolution["integrals"], dtype=float)
             average_values = np.asarray(evolution["averages"], dtype=float)
         else:
-            steps = int(np.ceil(max_horizon / dt))
-            times = np.arange(steps + 1, dtype=float) * dt
-            fields = observed.copy()
+            steps = int(np.ceil(max(horizons) / timestep))
+            field_grid = observed.copy()
             scores = np.empty(steps + 1, dtype=float)
-            scores[0] = combined_signal
+            scores[0] = _weighted_mean(field_grid.ravel(), grid_weights.ravel())
             for step in range(1, steps + 1):
-                fields = _advance_pde(fields, observed, distances, expiries, self.config.pde, dt)
-                scores[step] = _weighted_mean(fields.ravel(), grid_weights.ravel())
+                field_grid = _advance_pde(field_grid, observed, distances, expiries, pde_config, timestep)
+                scores[step] = _weighted_mean(field_grid.ravel(), grid_weights.ravel())
             integrated_values = []
             average_values = []
             trapezoid = getattr(np, "trapezoid", np.trapz)
             for horizon in horizons:
-                index = min(int(np.ceil(horizon / dt)), steps)
-                local_times = times[: index + 1]
-                local_scores = scores[: index + 1]
-                integrated = float(trapezoid(local_scores, local_times))
-                integrated_values.append(integrated)
-                average_values.append(integrated / max(float(local_times[-1]), EPS))
-            integrated_values = np.asarray(integrated_values, dtype=float)
-            average_values = np.asarray(average_values, dtype=float)
+                index = min(int(np.ceil(horizon / timestep)), steps)
+                elapsed = np.arange(index + 1, dtype=float) * timestep
+                integral = float(trapezoid(scores[: index + 1], elapsed))
+                integrated_values.append(integral)
+                average_values.append(integral / max(float(elapsed[-1]), EPS))
+            integrated_values = np.asarray(integrated_values)
+            average_values = np.asarray(average_values)
 
-        volatility = self._volatility(chain, state)
+        volatility = self._volatility(chain, state, chain_summary)
+        mean_pair_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
+        liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
+        asymmetry = max(elo_config.up_difficulty - elo_config.down_difficulty, 0.0)
         expectations: dict[float, Expectation] = {}
         for horizon, integrated, average in zip(horizons, integrated_values, average_values):
-            integrated = float(integrated)
-            average = float(average)
-            # The same signal magnitude produces a larger downside move than
-            # upside move because the latter is modeled as harder to achieve.
-            asymmetry = self.config.elo.up_difficulty - self.config.elo.down_difficulty
-            direction_scale = 1.0 - asymmetry * 0.25 if average >= 0 else 1.0 + asymmetry * 0.25
-            year_fraction = float(horizon) / self.config.pde.trading_minutes_per_year
-            expected_log_return = average * volatility * sqrt(max(year_fraction, 0.0)) * direction_scale
-            return_variance = volatility * volatility * max(year_fraction, 0.0) * (1.0 + mean_variance)
-            expected_price = state.spot * exp(expected_log_return)
+            integrated_value = float(integrated)
+            average_value = float(average)
+            direction_scale = 1.0 / (1.0 + 0.20 * asymmetry) if average_value >= 0.0 else 1.0 + 0.20 * asymmetry
+            year_fraction = float(horizon) / pde_config.trading_minutes_per_year
+            expected_log_return = average_value * volatility * sqrt(max(year_fraction, 0.0)) * direction_scale * gamma_multiplier
+            risk_multiplier = (
+                1.0
+                + mean_pair_variance
+                + blend.projected_variance
+                + liquidity_risk
+                + pde_config.vrp_variance_scale * abs(chain_summary.volatility_risk_premium)
+            )
+            return_variance = volatility * volatility * max(year_fraction, 0.0) * risk_multiplier
+            expected_price = state.spot * exp(expected_log_return + 0.5 * return_variance)
             price_variance = expected_price * expected_price * np.expm1(return_variance)
-            z = expected_log_return / max(sqrt(return_variance), EPS)
+            z_score = expected_log_return / max(sqrt(return_variance), EPS)
             expectations[float(horizon)] = Expectation(
-                horizon_minutes=float(horizon),
-                integrated_signal=integrated,
-                average_signal=average,
-                expected_return=float(np.expm1(expected_log_return)),
-                expected_price=float(expected_price),
-                return_variance=float(return_variance),
-                price_variance=float(max(price_variance, 0.0)),
-                probability_up=float(_normal_cdf(z)),
+                float(horizon),
+                integrated_value,
+                average_value,
+                float(np.expm1(expected_log_return + 0.5 * return_variance)),
+                float(expected_price),
+                float(return_variance),
+                float(max(price_variance, 0.0)),
+                float(_normal_cdf(z_score)),
             )
 
         longest = expectations[max(expectations)]
         trend_score = float(np.tanh(longest.average_signal))
-        confidence_score = float(np.clip(0.5 * composite_confidence + 0.5 * abs(trend_score), 0.0, 1.0))
-        diagnostics = {
-            "premium_elo": float(premium_signal),
-            "current_field_signal": float(current_signal),
-            "composite_signal": float(composite_signal),
-            "composite_confidence": float(composite_confidence),
-            "energy_signal": energy_signal,
-            "flow_signal": float(flow_signal),
+        confidence = float(np.clip(
+            blend.confidence
+            * (0.35 + 0.65 * chain_summary.liquidity_quality)
+            * np.exp(-blend.projected_variance),
+            0.0,
+            1.0,
+        ))
+        median_distance = float(np.median(distances))
+        diagnostics: dict[str, object] = {
+            **factor_details,
+            "model_name": "Ocean Wave",
+            "cpp_core": HAS_CPP_CORE,
+            "composite_signal": blend.signal,
+            "composite_confidence": blend.confidence,
+            "projected_factor_variance": blend.projected_variance,
+            "current_field_signal": current_field_signal,
+            "energy_signal": chain_summary.energy_signal,
+            "iv_skew": chain_summary.iv_skew,
+            "iv_term_slope": chain_summary.iv_term_slope,
+            "iv_curvature": chain_summary.iv_curvature,
+            "volatility_risk_premium": chain_summary.volatility_risk_premium,
+            "oi_signal": chain_summary.oi_signal,
+            "gex_balance": chain_summary.gex_balance,
+            "gex_net": chain_summary.gex_net,
+            "gamma_multiplier": gamma_multiplier,
+            "liquidity_quality": chain_summary.liquidity_quality,
             "flow_velocity": float(flow_summary.velocity if flow_summary is not None else 0.0),
             "large_flow_notional": float(flow_summary.large_net_notional if flow_summary is not None else 0.0),
             "large_flow_gross_notional": float(flow_summary.large_gross_notional if flow_summary is not None else 0.0),
             "large_flow_count": float(flow_summary.large_trade_count if flow_summary is not None else 0),
-            "large_flow_confidence": float(flow_summary.confidence if flow_summary is not None else 0.0),
-            "inverse_native_signal": float(inverse_native_signal),
-            "inverse_target_signal": float(inverse_target_signal),
-            "inverse_confidence": float(inverse_confidence),
+            "dealer_hedge_shares": float(flow_summary.delta_hedge_shares if flow_summary is not None else 0.0),
+            "inverse_native_signal": inverse_native,
+            "inverse_target_signal": inverse_target,
+            "inverse_confidence": inverse_confidence,
             "inverse_count": float(len(inverse_symbols)),
             "inverse_symbols": ",".join(inverse_symbols),
-            "mean_pair_variance": float(mean_variance),
-            "mean_pair_confidence": float(mean_confidence),
-            "upward_cost_at_median_distance": up_cost,
-            "downward_cost_at_median_distance": down_cost,
-            "integrated_signal": float(longest.integrated_signal),
-            "expected_return": float(longest.expected_return),
-            "probability_up": float(longest.probability_up),
+            "dynamic_up_difficulty": elo_config.up_difficulty,
+            "dynamic_down_difficulty": elo_config.down_difficulty,
+            "upward_cost_at_median_distance": float(asymmetric_cost(median_distance, "up", elo_config)),
+            "downward_cost_at_median_distance": float(asymmetric_cost(median_distance, "down", elo_config)),
+            "expected_return": longest.expected_return,
+            "probability_up": longest.probability_up,
         }
         return ModelResult(
             trend_score=trend_score,
             direction=self._direction(trend_score),
-            confidence=confidence_score,
+            confidence=confidence,
             diagnostics=diagnostics,
+            factor_table=blend.table,
+            factor_covariance=self._factor_state.covariance.copy(),
+            chain_factors=chain_summary,
             flow_summary=flow_summary,
             expectations=expectations,
             elo_surface=surface,
             distance_grid=distances,
             expiry_grid=expiries,
-            field_grid=fields,
+            field_grid=field_grid,
         )
 
-    def _volatility(self, chain: pd.DataFrame, state: MarketState) -> float:
-        if state.realized_vol is not None and state.realized_vol > 0:
+    def _volatility(self, chain: pd.DataFrame, state: MarketState, summary: ChainFactorSummary) -> float:
+        if state.realized_vol is not None and state.realized_vol > 0.0:
             return float(state.realized_vol)
-        iv_values = []
+        if summary.iv_level > 0.0:
+            return float(summary.iv_level)
+        iv_values: list[float] = []
         for column in ("call_iv", "put_iv", "iv"):
             if column in chain:
                 values = _numeric_column(chain, column, np.nan)
-                iv_values.extend(values[np.isfinite(values) & (values > 0)].tolist())
-        if iv_values:
-            return float(np.median(iv_values))
-        return float(self.config.pde.default_volatility)
+                iv_values.extend(values[np.isfinite(values) & (values > 0.0)].tolist())
+        return float(np.median(iv_values)) if iv_values else float(self.config.pde.default_volatility)
 
     @staticmethod
     def _direction(score: float) -> str:
@@ -479,3 +590,7 @@ class OptionWaveV09:
         if score < -0.10:
             return "Mild Bearish"
         return "Neutral"
+
+
+# Backward-compatible import for existing users of the v0.9 package API.
+OptionWaveV09 = OceanWave

@@ -27,7 +27,7 @@ def plot_field_surface(
     title: str,
     path: str,
 ) -> str:
-    """Render the v0.9 expiry x distance field as a 3D surface."""
+    """Render the Ocean Wave expiry x distance field as a 3D surface."""
 
     x, y = np.meshgrid(distances, expiries)
     figure = plt.figure(figsize=(10, 7))
@@ -36,7 +36,7 @@ def plot_field_surface(
     axis.set_title(title)
     axis.set_xlabel("Relative distance (+ Call / - Put)")
     axis.set_ylabel("Expiry (days)")
-    axis.set_zlabel("ELO / PDE signal")
+    axis.set_zlabel("Ocean energy ψ")
     figure.colorbar(surface, shrink=0.65, pad=0.12)
     figure.tight_layout()
     figure.savefig(path, dpi=180, bbox_inches="tight")

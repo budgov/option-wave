@@ -39,6 +39,12 @@ class FlowSummary:
     large_signal: float
     velocity: float
     confidence: float
+    delta_hedge_shares: float = 0.0
+    delta_hedge_gross_shares: float = 0.0
+    gamma_notional: float = 0.0
+    gamma_gross_notional: float = 0.0
+    hedge_signal: float = 0.0
+    greek_coverage: float = 0.0
 
 
 def _numeric(frame: pd.DataFrame, names: tuple[str, ...], default: float = np.nan) -> np.ndarray:
@@ -187,7 +193,27 @@ def aggregate_large_flow(
     if not len(notional):
         return FlowSummary(0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
     large_mask = (notional >= max(float(cfg.large_notional_threshold), 0.0)).astype(float)
-    if HAS_CPP_CORE:
+    delta = _numeric(frame, ("delta", "option_delta"), np.nan)[finite]
+    gamma = _numeric(frame, ("gamma", "option_gamma"), np.nan)[finite]
+    contracts_finite = contracts[finite]
+    spot_values = _numeric(frame, ("spot", "underlying_price"), np.nan)[finite]
+    valid_spot = spot_values[np.isfinite(spot_values) & (spot_values > 0.0)]
+    spot = float(np.median(valid_spot)) if len(valid_spot) else 0.0
+    if HAS_CPP_CORE and hasattr(cpp_core, "aggregate_flow_risk"):
+        result = cpp_core.aggregate_flow_risk(
+            np.ascontiguousarray(notional),
+            np.ascontiguousarray(direction),
+            np.ascontiguousarray(confidence),
+            np.ascontiguousarray(ages),
+            np.ascontiguousarray(large_mask),
+            np.ascontiguousarray(contracts_finite),
+            np.ascontiguousarray(delta),
+            np.ascontiguousarray(gamma),
+            float(spot),
+            float(cfg.half_life_minutes),
+        )
+        values = {key: float(result[key]) for key in result}
+    elif HAS_CPP_CORE:
         result = cpp_core.aggregate_flow(
             np.ascontiguousarray(notional),
             np.ascontiguousarray(direction),
@@ -199,6 +225,21 @@ def aggregate_large_flow(
         values = {key: float(result[key]) for key in result}
     else:
         values = _python_aggregate(notional, direction, confidence, ages, large_mask, cfg.half_life_minutes)
+        valid_delta = np.isfinite(delta)
+        delta_exposure = contracts_finite * 100.0 * np.nan_to_num(np.abs(delta)) * direction * confidence
+        delta_gross = contracts_finite * 100.0 * np.nan_to_num(np.abs(delta)) * confidence
+        gamma_exposure = contracts_finite * 100.0 * np.nan_to_num(np.abs(gamma)) * spot * spot * direction * confidence
+        gamma_gross = contracts_finite * 100.0 * np.nan_to_num(np.abs(gamma)) * spot * spot * confidence
+        delta_ratio = float(delta_exposure.sum() / max(delta_gross.sum(), 1e-12))
+        gamma_ratio = float(gamma_exposure.sum() / max(gamma_gross.sum(), 1e-12))
+        values.update({
+            "delta_hedge_shares": float(delta_exposure.sum()),
+            "delta_hedge_gross_shares": float(delta_gross.sum()),
+            "gamma_notional": float(gamma_exposure.sum()),
+            "gamma_gross_notional": float(gamma_gross.sum()),
+            "hedge_signal": float(np.tanh(0.75 * delta_ratio + 0.25 * gamma_ratio)),
+            "greek_coverage": float(np.count_nonzero(valid_delta) / max(len(delta), 1)),
+        })
     return FlowSummary(
         net_notional=values["net_notional"],
         gross_notional=values["gross_notional"],
@@ -209,4 +250,10 @@ def aggregate_large_flow(
         large_signal=values["large_signal"],
         velocity=values["velocity"],
         confidence=values["confidence"],
+        delta_hedge_shares=values.get("delta_hedge_shares", 0.0),
+        delta_hedge_gross_shares=values.get("delta_hedge_gross_shares", 0.0),
+        gamma_notional=values.get("gamma_notional", 0.0),
+        gamma_gross_notional=values.get("gamma_gross_notional", 0.0),
+        hedge_signal=values.get("hedge_signal", 0.0),
+        greek_coverage=values.get("greek_coverage", 0.0),
     )

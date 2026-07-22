@@ -1,14 +1,22 @@
-"""Option Wave Forecast Model v0.9."""
+"""Ocean Wave financial-engineering forecast model."""
 
 from ._backend import HAS_CPP_CORE
 from .elo import EloConfig, asymmetric_cost, build_elo_surface, build_symmetric_pairs
 from .flow import FlowConfig, FlowSummary, aggregate_large_flow
+from .factors import (
+    DEFAULT_FACTOR_PRIORS,
+    FACTOR_NAMES,
+    ChainFactorSummary,
+    FactorConfig,
+    ShortData,
+)
 from .inverse import InverseLink, InverseMarketData, InverseRegistry
 from .model import (
     Expectation,
     InverseConfig,
     MarketState,
     ModelConfig,
+    OceanWave,
     OptionWaveV09,
     PDEConfig,
 )
@@ -18,12 +26,18 @@ __all__ = [
     "EloConfig",
     "FlowConfig",
     "FlowSummary",
+    "FactorConfig",
+    "ChainFactorSummary",
+    "ShortData",
+    "FACTOR_NAMES",
+    "DEFAULT_FACTOR_PRIORS",
     "InverseConfig",
     "PDEConfig",
     "ModelConfig",
     "MarketState",
     "Expectation",
     "OptionWaveV09",
+    "OceanWave",
     "HAS_CPP_CORE",
     "asymmetric_cost",
     "build_symmetric_pairs",

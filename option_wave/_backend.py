@@ -1,4 +1,4 @@
-"""Optional compiled backend selector.
+"""Optional Ocean Wave compiled-backend selector.
 
 The source tree remains importable before an editable install. Once
 ``pip install -e .`` has built the extension, the numerical hot paths use C++.

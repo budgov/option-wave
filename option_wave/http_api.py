@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from .inverse import InverseMarketData, InverseRegistry
+from .factors import ShortData
 from .model import MarketState
 
 
@@ -140,7 +141,7 @@ class MassiveHTTPClient:
             if not isinstance(payload, Mapping):
                 raise HTTPAPIError("transport returned a non-object JSON payload")
             return payload
-        request = Request(url, headers={"Accept": "application/json", "User-Agent": "option-wave/0.9"})
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "ocean-wave/1.0"})
         try:
             with urlopen(request, timeout=max(float(self.config.timeout_seconds), 0.1)) as response:
                 status = getattr(response, "status", 200)
@@ -226,6 +227,8 @@ class MassiveHTTPClient:
                 f"{prefix}_gamma": _float(_first(greeks, "gamma")),
                 f"{prefix}_vega": _float(_first(greeks, "vega")),
                 f"{prefix}_theta": _float(_first(greeks, "theta")),
+                f"{prefix}_vanna": _float(_first(greeks, "vanna")),
+                f"{prefix}_charm": _float(_first(greeks, "charm")),
                 f"{prefix}_timestamp": _timestamp(_first(trade, "sip_timestamp", "timestamp")),
             })
         if not rows:
@@ -239,6 +242,36 @@ class MassiveHTTPClient:
 
         normalized = frame.groupby(["strike", "expiry_days"], as_index=False, sort=True)[value_columns].agg(first_valid)
         return normalized
+
+    @staticmethod
+    def normalize_short_data(payload: Mapping[str, Any], *, confidence: float = 1.0) -> ShortData:
+        """Normalize a provider's short-interest/borrow JSON object.
+
+        This is intentionally endpoint-neutral because short interest, daily
+        short volume, and securities-lending data often come from different
+        HTTPS vendors. Percent-like values above one are converted to decimal
+        units when they are at most 100.
+        """
+
+        result = payload.get("results") if isinstance(payload.get("results"), Mapping) else payload
+
+        def decimal(*names: str) -> float | None:
+            value = _float(_first(result, *names))
+            if not np.isfinite(value):
+                return None
+            return value / 100.0 if 1.0 < abs(value) <= 100.0 else value
+
+        days = _float(_first(result, "days_to_cover", "short_ratio"))
+        return ShortData(
+            short_interest_ratio=decimal("short_interest_ratio", "short_percent_float", "short_float"),
+            short_interest_change=decimal("short_interest_change", "short_change", "short_interest_delta"),
+            short_volume_ratio=decimal("short_volume_ratio", "short_volume_percent", "short_volume_pct"),
+            borrow_fee=decimal("borrow_fee", "cost_to_borrow", "borrow_rate"),
+            utilization=decimal("utilization", "borrow_utilization"),
+            days_to_cover=days if np.isfinite(days) else None,
+            confidence=float(np.clip(confidence, 0.0, 1.0)),
+            as_of=_first(result, "as_of", "date", "timestamp"),
+        )
 
     def fetch_option_chain(
         self,

@@ -1,4 +1,4 @@
-"""Universal inverse-instrument links for Option Wave v0.9.
+"""Universal inverse-instrument links for Ocean Wave.
 
 An inverse product is an observed companion instrument, not a synthetic
 prediction.  The registry therefore stores only explicit relationships and
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from math import atanh, tanh
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -49,7 +50,9 @@ class InverseLink:
         if self.beta == 0.0:
             return 0.0
         sign = -1.0 if self.beta < 0.0 else 1.0
-        return max(-1.0, min(1.0, sign * float(native_signal)))
+        bounded = max(-0.999999, min(0.999999, float(native_signal)))
+        normalized = tanh(atanh(bounded) / max(abs(self.beta), 1.0))
+        return max(-1.0, min(1.0, sign * normalized))
 
 
 # These are conservative, commonly used daily inverse products.  The

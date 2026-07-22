@@ -6,12 +6,15 @@ import numpy as np
 import pandas as pd
 
 from option_wave import (
+    FACTOR_NAMES,
     InverseLink,
     InverseMarketData,
     InverseRegistry,
     MarketState,
     MassiveHTTPClient,
+    OceanWave,
     OptionWaveV09,
+    ShortData,
     aggregate_large_flow,
 )
 from option_wave.elo import EloConfig, asymmetric_cost, build_symmetric_pairs
@@ -34,11 +37,17 @@ def chain(spread: float = 0.10) -> pd.DataFrame:
                 "put_oi": 5000.0,
                 "call_iv": 0.25,
                 "put_iv": 0.26,
+                "call_delta": 0.50,
+                "put_delta": -0.50,
+                "call_gamma": 0.02,
+                "put_gamma": 0.02,
+                "call_vega": 0.10,
+                "put_vega": 0.10,
             })
     return pd.DataFrame(rows)
 
 
-class OptionWaveV09Tests(unittest.TestCase):
+class OceanWaveTests(unittest.TestCase):
     def test_symmetric_pair_is_relative_not_same_strike(self) -> None:
         pairs = build_symmetric_pairs(chain(), spot=100.0)
         match = pairs[(pairs.expiry_days == 0) & np.isclose(pairs.distance_pct, 0.05)]
@@ -61,7 +70,7 @@ class OptionWaveV09Tests(unittest.TestCase):
         self.assertGreater(tight_conf, wide_conf)
 
     def test_model_returns_integrated_expectations(self) -> None:
-        model = OptionWaveV09()
+        model = OceanWave()
         result = model.predict(
             chain(),
             MarketState(spot=100.0, realized_vol=0.25),
@@ -73,6 +82,9 @@ class OptionWaveV09Tests(unittest.TestCase):
         self.assertTrue(np.isfinite(result.expectations[30.0].expected_price))
         self.assertGreaterEqual(result.expectations[30.0].probability_up, 0.0)
         self.assertLessEqual(result.expectations[30.0].probability_up, 1.0)
+        self.assertEqual(set(result.factor_table.factor), set(FACTOR_NAMES))
+        self.assertAlmostEqual(float(result.factor_table.dynamic_weight.sum()), 1.0)
+        self.assertEqual(result.diagnostics["model_name"], "Ocean Wave")
 
     def test_online_elo_state_changes_between_snapshots(self) -> None:
         model = OptionWaveV09()
@@ -94,6 +106,9 @@ class OptionWaveV09Tests(unittest.TestCase):
                 "contracts": 10_000,
                 "trade_price": 2.0,
                 "is_opening": True,
+                "delta": 0.45,
+                "gamma": 0.02,
+                "spot": 100.0,
             },
             {
                 "timestamp": "2026-07-18T14:59:00Z",
@@ -116,6 +131,70 @@ class OptionWaveV09Tests(unittest.TestCase):
         self.assertGreater(summary.large_net_notional, 0.0)
         self.assertGreater(summary.large_signal, 0.0)
         self.assertGreater(summary.confidence, 0.0)
+        self.assertGreater(summary.delta_hedge_shares, 0.0)
+        self.assertGreater(summary.hedge_signal, 0.0)
+
+    def test_short_pressure_and_dynamic_asymmetry_enter_model(self) -> None:
+        result = OceanWave().predict(
+            chain(),
+            MarketState(
+                spot=98.0,
+                previous_close=100.0,
+                vwap=99.0,
+                return_5m=-0.01,
+                return_15m=-0.015,
+                realized_vol=0.25,
+            ),
+            short_data=ShortData(
+                short_interest_ratio=0.25,
+                short_interest_change=0.12,
+                short_volume_ratio=0.65,
+                borrow_fee=0.18,
+                utilization=0.92,
+                days_to_cover=5.0,
+            ),
+            horizons_minutes=(30.0,),
+        )
+        short_row = result.factor_table.loc[result.factor_table.factor == "short_pressure"].iloc[0]
+        self.assertLess(float(short_row.signal), 0.0)
+        self.assertGreater(float(short_row.confidence), 0.0)
+        self.assertGreater(
+            float(result.diagnostics["dynamic_up_difficulty"]),
+            float(result.diagnostics["dynamic_down_difficulty"]),
+        )
+
+    def test_iv_gex_and_oi_statistics_are_extracted(self) -> None:
+        current = chain()
+        previous = current.copy()
+        current["call_oi"] += 200.0
+        current["put_oi"] += 50.0
+        current.loc[current.strike <= 100.0, "put_iv"] = 0.34
+        result = OceanWave().predict(
+            current,
+            MarketState(spot=100.0, realized_vol=0.20),
+            previous_chain=previous,
+            horizons_minutes=(30.0,),
+        )
+        self.assertLess(result.chain_factors.iv_surface_signal, 0.0)
+        self.assertGreater(result.chain_factors.oi_signal, 0.0)
+        self.assertTrue(np.isfinite(result.chain_factors.gex_net))
+        self.assertGreater(result.chain_factors.iv_coverage, 0.0)
+
+    def test_short_json_normalizer_uses_decimal_units(self) -> None:
+        short_data = MassiveHTTPClient.normalize_short_data({
+            "short_percent_float": 22.0,
+            "short_interest_change": 5.0,
+            "short_volume_ratio": 0.61,
+            "cost_to_borrow": 18.0,
+            "utilization": 91.0,
+            "days_to_cover": 4.2,
+        })
+        self.assertAlmostEqual(short_data.short_interest_ratio or 0.0, 0.22)
+        self.assertAlmostEqual(short_data.borrow_fee or 0.0, 0.18)
+        self.assertAlmostEqual(short_data.utilization or 0.0, 0.91)
+
+    def test_legacy_class_name_remains_an_alias(self) -> None:
+        self.assertIs(OptionWaveV09, OceanWave)
 
     def test_inverse_index_is_mapped_back_to_target_direction(self) -> None:
         inverse = chain()
