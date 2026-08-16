@@ -110,10 +110,9 @@ struct PairRow {
     double put_delta;
 };
 
-double asymmetric_cost(double distance, bool upside, double exponent, double up_difficulty, double down_difficulty, double min_distance) {
+double energy_cost(double distance, double exponent, double min_distance) {
     const double d = std::max(std::abs(distance), min_distance);
-    const double difficulty = upside ? up_difficulty : down_difficulty;
-    return std::pow(d, exponent) * std::exp(difficulty * d);
+    return std::pow(d, exponent);
 }
 
 py::dict pair_dict(const std::vector<PairRow>& rows) {
@@ -208,8 +207,6 @@ py::dict build_pairs(
     double spot,
     double min_distance,
     double distance_exponent,
-    double up_difficulty,
-    double down_difficulty,
     double variance_floor,
     double variance_scale,
     double expiry_decay_days
@@ -298,10 +295,9 @@ py::dict build_pairs(
             const double poi = interpolate(x, p_oi, put_strike);
             const double cd = interpolate(x, c_delta, call_strike);
             const double pd = interpolate(x, p_delta, put_strike);
-            const double call_cost = asymmetric_cost(distance, true, distance_exponent, up_difficulty, down_difficulty, min_distance);
-            const double put_cost = asymmetric_cost(distance, false, distance_exponent, up_difficulty, down_difficulty, min_distance);
-            const double cf = cp / (call_cost + EPS);
-            const double pf = pp / (put_cost + EPS);
+            const double pair_cost = energy_cost(distance, distance_exponent, min_distance);
+            const double cf = cp / (pair_cost + EPS);
+            const double pf = pp / (pair_cost + EPS);
             const double raw = cf / (cf + pf + EPS);
             const double pair_var = std::max(cv + pv, variance_floor);
             const double pair_confidence = 1.0 / (1.0 + pair_var / std::max(variance_scale, EPS));

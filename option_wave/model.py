@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ._backend import HAS_CPP_CORE, cpp_core
-from .elo import EPS, EloConfig, asymmetric_cost, build_elo_surface, premium_sentiment_elo
+from .elo import EPS, EloConfig, build_elo_surface, energy_cost, premium_sentiment_elo
 from .factors import (
     ChainFactorSummary,
     FactorBlend,
@@ -260,16 +260,6 @@ class OceanWave:
         target_signal, confidence = _combine_indicators(target_values, confidences)
         return native_signal, target_signal, confidence, tuple(symbols)
 
-    def _dynamic_elo_config(self, chain_summary: ChainFactorSummary, short_factor_pressure: float) -> EloConfig:
-        skew_stress = float(np.clip(max(chain_summary.iv_skew, 0.0) / 0.10, 0.0, 1.5))
-        liquidity_stress = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
-        short_stress = float(np.clip(max(short_factor_pressure, 0.0), 0.0, 1.0))
-        return replace(
-            self.config.elo,
-            up_difficulty=self.config.elo.up_difficulty + 0.55 * skew_stress + 0.25 * liquidity_stress + 0.20 * short_stress,
-            down_difficulty=self.config.elo.down_difficulty - 0.55 * skew_stress - 0.35 * liquidity_stress - 0.20 * short_stress,
-        )
-
     def _dynamic_pde_config(self, chain_summary: ChainFactorSummary) -> tuple[PDEConfig, float]:
         base = self.config.pde
         negative_gamma = max(-chain_summary.gex_balance, 0.0)
@@ -387,9 +377,7 @@ class OceanWave:
             realized_vol=state.realized_vol,
             previous_chain=previous_chain,
         )
-        preliminary_stock, _ = stock_confirmation(state)
-        preliminary_short = short_pressure(short_data, preliminary_stock)
-        elo_config = self._dynamic_elo_config(chain_summary, preliminary_short.pressure)
+        elo_config = self.config.elo
         surface = build_elo_surface(chain, state.spot, elo_config, self._ratings)
         price_signal = 2.0 * surface["effective_score"].to_numpy(float) - 1.0
         pair_confidence = surface["confidence"].to_numpy(float)
@@ -472,14 +460,12 @@ class OceanWave:
         volatility = self._volatility(chain, state, chain_summary)
         mean_pair_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
         liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
-        asymmetry = max(elo_config.up_difficulty - elo_config.down_difficulty, 0.0)
         expectations: dict[float, Expectation] = {}
         for horizon, integrated, average in zip(horizons, integrated_values, average_values):
             integrated_value = float(integrated)
             average_value = float(average)
-            direction_scale = 1.0 / (1.0 + 0.20 * asymmetry) if average_value >= 0.0 else 1.0 + 0.20 * asymmetry
             year_fraction = float(horizon) / pde_config.trading_minutes_per_year
-            expected_log_return = average_value * volatility * sqrt(max(year_fraction, 0.0)) * direction_scale * gamma_multiplier
+            expected_log_return = average_value * volatility * sqrt(max(year_fraction, 0.0)) * gamma_multiplier
             risk_multiplier = (
                 1.0
                 + mean_pair_variance
@@ -540,10 +526,7 @@ class OceanWave:
             "inverse_confidence": inverse_confidence,
             "inverse_count": float(len(inverse_symbols)),
             "inverse_symbols": ",".join(inverse_symbols),
-            "dynamic_up_difficulty": elo_config.up_difficulty,
-            "dynamic_down_difficulty": elo_config.down_difficulty,
-            "upward_cost_at_median_distance": float(asymmetric_cost(median_distance, "up", elo_config)),
-            "downward_cost_at_median_distance": float(asymmetric_cost(median_distance, "down", elo_config)),
+            "energy_cost_at_median_distance": float(energy_cost(median_distance, elo_config)),
             "expected_return": longest.expected_return,
             "probability_up": longest.probability_up,
         }

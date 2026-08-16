@@ -4,8 +4,8 @@ Preserve these invariants:
 
 1. Pair `+d Call` with `-d Put` at the same expiry; never replace this with a
    same-strike Call/Put comparison.
-2. Keep upside/downside resistance asymmetric and dynamically dependent on IV
-   skew, liquidity, and short pressure.
+2. Use one direction-neutral distance cost for both sides of every symmetric
+   Call/Put pair; IV skew, liquidity, and short pressure remain separate factors.
 3. Treat symmetric premium ELO as one factor—not the whole model.
 4. Keep verified institutional flow, dealer hedge pressure, IV surface, short
    pressure, OI positioning, stock confirmation, inverse products, and option

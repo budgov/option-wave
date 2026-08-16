@@ -17,7 +17,7 @@ from option_wave import (
     ShortData,
     aggregate_large_flow,
 )
-from option_wave.elo import EloConfig, asymmetric_cost, build_symmetric_pairs
+from option_wave.elo import EloConfig, energy_cost, build_symmetric_pairs
 
 
 def chain(spread: float = 0.10) -> pd.DataFrame:
@@ -56,11 +56,14 @@ class OceanWaveTests(unittest.TestCase):
         self.assertAlmostEqual(row.call_strike, 105.0)
         self.assertAlmostEqual(row.put_strike, 95.0)
 
-    def test_upside_cost_is_higher_than_downside_cost(self) -> None:
+    def test_energy_cost_is_direction_neutral(self) -> None:
         cfg = EloConfig()
-        up = asymmetric_cost(0.05, "up", cfg)
-        down = asymmetric_cost(0.05, "down", cfg)
-        self.assertGreater(float(up), float(down))
+        cost = energy_cost(0.05, cfg)
+        self.assertAlmostEqual(float(cost), 0.05)
+
+        pairs = build_symmetric_pairs(chain(), spot=100.0, cfg=cfg)
+        row = pairs[(pairs.expiry_days == 0) & np.isclose(pairs.distance_pct, 0.05)].iloc[0]
+        self.assertAlmostEqual(float(row.call_force), float(row.put_force))
 
     def test_wider_quotes_reduce_pair_confidence(self) -> None:
         tight = build_symmetric_pairs(chain(0.02), spot=100.0)
@@ -134,7 +137,7 @@ class OceanWaveTests(unittest.TestCase):
         self.assertGreater(summary.delta_hedge_shares, 0.0)
         self.assertGreater(summary.hedge_signal, 0.0)
 
-    def test_short_pressure_and_dynamic_asymmetry_enter_model(self) -> None:
+    def test_short_pressure_enters_model_without_changing_energy_cost(self) -> None:
         result = OceanWave().predict(
             chain(),
             MarketState(
@@ -158,10 +161,8 @@ class OceanWaveTests(unittest.TestCase):
         short_row = result.factor_table.loc[result.factor_table.factor == "short_pressure"].iloc[0]
         self.assertLess(float(short_row.signal), 0.0)
         self.assertGreater(float(short_row.confidence), 0.0)
-        self.assertGreater(
-            float(result.diagnostics["dynamic_up_difficulty"]),
-            float(result.diagnostics["dynamic_down_difficulty"]),
-        )
+        expected_cost = energy_cost(float(np.median(result.distance_grid)), EloConfig())
+        self.assertAlmostEqual(float(result.diagnostics["energy_cost_at_median_distance"]), float(expected_cost))
 
     def test_iv_gex_and_oi_statistics_are_extracted(self) -> None:
         current = chain()
