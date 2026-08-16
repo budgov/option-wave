@@ -282,8 +282,10 @@ and the implemented explicit step is
 \boxed{\mathbf x_{n+1}=(I+\Delta t A_t)\mathbf x_n+\Delta t B_t\mathbf f_t}.
 \]
 
-The C++ kernel operates directly on contiguous arrays and integrates all
-requested horizons in one pass.
+The C++ kernel operates directly on contiguous arrays. It constructs the
+strike-expiry grid, projects the global factor signal, evolves the PDE, and
+integrates all requested horizons in one call. The Python implementation is a
+portable numerical reference rather than the production hot path.
 
 ## 10. Time integral and complete expectation
 

@@ -19,8 +19,10 @@ Preserve these invariants:
 
 Numerical hot paths belong in the C++17 extension: pairing/interpolation, ELO,
 IV weighted least squares, OI/GEX/energy extraction, flow risk, covariance
-weighting, and PDE integration. Python is the HTTPS/API and object boundary.
-Keep the reference path for portability and numerical cross-checks.
+weighting, stock confirmation, surface-grid construction, factor projection,
+PDE integration, and multi-horizon expectations. Python is the HTTPS/API,
+DataFrame normalization, orchestration, and object boundary. Keep the
+reference path for portability and numerical cross-checks.
 
 Never guess whale direction, dealer inventory, short data, or inverse products.
 Unknown evidence gets zero confidence. Live data must use online HTTPS or

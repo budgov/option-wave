@@ -182,10 +182,14 @@ it must not attempt to run the Python extension inside a Worker.
 
 ## Performance
 
-The hot path is C++: symmetric interpolation, ELO updates, IV-surface weighted
-least squares, OI/GEX/energy extraction, institutional-flow risk, covariance
-weighting, and PDE time stepping. Python is limited to API adapters,
-DataFrame-to-array normalization, online state keys, and result objects.
+The hot path is C++: symmetric interpolation, ELO updates and aggregation,
+IV-surface weighted least squares, OI/GEX/energy extraction,
+institutional-flow risk, stock confirmation, covariance weighting, surface
+grid construction, factor-to-field projection, PDE time stepping, and
+multi-horizon expectation/variance calculations. The compiled path crosses
+from Python into C++ once for the complete surface-to-forecast stage. Python
+is limited to API adapters, DataFrame-to-array normalization, online state
+keys, orchestration, and result objects.
 
 Run the benchmark locally:
 

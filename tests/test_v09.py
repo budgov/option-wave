@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,9 @@ from option_wave import (
     OptionWaveV09,
     ShortData,
     aggregate_large_flow,
+    HAS_CPP_CORE,
 )
+from option_wave._backend import cpp_core
 from option_wave.elo import EloConfig, energy_cost, build_symmetric_pairs
 
 
@@ -88,6 +91,63 @@ class OceanWaveTests(unittest.TestCase):
         self.assertEqual(set(result.factor_table.factor), set(FACTOR_NAMES))
         self.assertAlmostEqual(float(result.factor_table.dynamic_weight.sum()), 1.0)
         self.assertEqual(result.diagnostics["model_name"], "Ocean Wave")
+
+    @unittest.skipUnless(HAS_CPP_CORE, "compiled extension is not installed")
+    def test_cpp_forecast_matches_python_reference(self) -> None:
+        native = OceanWave().predict(
+            chain(),
+            MarketState(
+                spot=100.0,
+                previous_close=99.5,
+                vwap=99.8,
+                return_5m=0.001,
+                return_15m=0.002,
+                rvol=1.2,
+                realized_vol=0.25,
+            ),
+            horizons_minutes=(5.0, 30.0),
+        )
+        with (
+            patch("option_wave.elo.HAS_CPP_CORE", False),
+            patch("option_wave.factors.HAS_CPP_CORE", False),
+            patch("option_wave.flow.HAS_CPP_CORE", False),
+            patch("option_wave.model.HAS_CPP_CORE", False),
+        ):
+            reference = OceanWave().predict(
+                chain(),
+                MarketState(
+                    spot=100.0,
+                    previous_close=99.5,
+                    vwap=99.8,
+                    return_5m=0.001,
+                    return_15m=0.002,
+                    rvol=1.2,
+                    realized_vol=0.25,
+                ),
+                horizons_minutes=(5.0, 30.0),
+            )
+
+        np.testing.assert_allclose(native.field_grid, reference.field_grid, rtol=1e-10, atol=1e-12)
+        self.assertAlmostEqual(native.trend_score, reference.trend_score, places=10)
+        self.assertAlmostEqual(native.confidence, reference.confidence, places=10)
+        for horizon in (5.0, 30.0):
+            self.assertAlmostEqual(
+                native.expectations[horizon].expected_price,
+                reference.expectations[horizon].expected_price,
+                places=10,
+            )
+
+    @unittest.skipUnless(HAS_CPP_CORE, "compiled extension is not installed")
+    def test_cpp_surface_aggregate_is_available(self) -> None:
+        result = cpp_core.aggregate_surface_signals(
+            np.asarray([0.60, 0.40]),
+            np.asarray([0.80, 0.80]),
+            np.asarray([0.25, -0.25]),
+            np.asarray([1.00, 1.00]),
+        )
+        np.testing.assert_allclose(np.asarray(result["pair_signal"]), [0.24, -0.24])
+        self.assertAlmostEqual(float(result["premium_signal"]), 0.0)
+        self.assertAlmostEqual(float(result["mean_pair_confidence"]), 0.8)
 
     def test_online_elo_state_changes_between_snapshots(self) -> None:
         model = OptionWaveV09()

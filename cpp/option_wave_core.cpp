@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "ocean_wave_kernels.hpp"
+
 namespace py = pybind11;
 using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 constexpr double EPS = 1e-12;
@@ -83,6 +85,13 @@ py::array_t<double> to_array(const std::vector<T>& values) {
     py::array_t<double> result(values.size());
     auto output = result.mutable_unchecked<1>();
     for (std::size_t i = 0; i < values.size(); ++i) output(i) = static_cast<double>(values[i]);
+    return result;
+}
+
+std::vector<double> to_vector(const DoubleArray& values) {
+    const auto view = values.unchecked<1>();
+    std::vector<double> result(values.size());
+    for (ssize_t i = 0; i < values.size(); ++i) result[static_cast<std::size_t>(i)] = view(i);
     return result;
 }
 
@@ -991,6 +1000,110 @@ py::dict evolve_field(
     return result;
 }
 
+py::dict aggregate_surface_signals(
+    const DoubleArray& effective_score,
+    const DoubleArray& confidence,
+    const DoubleArray& elo_signal,
+    const DoubleArray& pair_weight
+) {
+    const ocean_wave::SurfaceAggregate aggregate = ocean_wave::aggregate_surface(
+        to_vector(effective_score),
+        to_vector(confidence),
+        to_vector(elo_signal),
+        to_vector(pair_weight)
+    );
+    py::dict result;
+    result["pair_signal"] = to_array(aggregate.pair_signal);
+    result["premium_signal"] = aggregate.premium_signal;
+    result["mean_pair_confidence"] = aggregate.mean_pair_confidence;
+    return result;
+}
+
+py::dict compute_stock_confirmation(
+    double spot,
+    double previous_close,
+    double vwap,
+    double return_5m,
+    double return_15m,
+    double rvol,
+    double realized_vol,
+    double data_confidence
+) {
+    const ocean_wave::StockConfirmation confirmation = ocean_wave::stock_confirmation(
+        spot, previous_close, vwap, return_5m, return_15m, rvol, realized_vol, data_confidence
+    );
+    py::dict result;
+    result["signal"] = confirmation.signal;
+    result["confidence"] = confirmation.confidence;
+    return result;
+}
+
+py::dict forecast_surface(
+    const DoubleArray& row_expiry,
+    const DoubleArray& row_distance,
+    const DoubleArray& row_pair_signal,
+    const DoubleArray& row_pair_weight,
+    const DoubleArray& row_pair_variance,
+    double composite_signal,
+    double composite_confidence,
+    double projected_factor_variance,
+    double spot,
+    double volatility,
+    double liquidity_quality,
+    double volatility_risk_premium,
+    double vrp_variance_scale,
+    double gamma_multiplier,
+    double trading_minutes_per_year,
+    double distance_diffusion,
+    double expiry_diffusion,
+    double distance_drift,
+    double decay,
+    double source_strength,
+    double timestep_minutes,
+    const std::vector<double>& horizons
+) {
+    const ocean_wave::Forecast forecast = ocean_wave::forecast_surface(
+        to_vector(row_expiry),
+        to_vector(row_distance),
+        to_vector(row_pair_signal),
+        to_vector(row_pair_weight),
+        to_vector(row_pair_variance),
+        composite_signal,
+        composite_confidence,
+        projected_factor_variance,
+        spot,
+        volatility,
+        liquidity_quality,
+        volatility_risk_premium,
+        vrp_variance_scale,
+        gamma_multiplier,
+        trading_minutes_per_year,
+        distance_diffusion,
+        expiry_diffusion,
+        distance_drift,
+        decay,
+        source_strength,
+        timestep_minutes,
+        horizons
+    );
+    py::dict result;
+    result["distances"] = to_array(forecast.distances);
+    result["expiries"] = to_array(forecast.expiries);
+    result["field"] = to_array(forecast.field);
+    result["integrals"] = to_array(forecast.integrals);
+    result["averages"] = to_array(forecast.averages);
+    result["expected_returns"] = to_array(forecast.expected_returns);
+    result["expected_prices"] = to_array(forecast.expected_prices);
+    result["return_variances"] = to_array(forecast.return_variances);
+    result["price_variances"] = to_array(forecast.price_variances);
+    result["probabilities_up"] = to_array(forecast.probabilities_up);
+    result["current_field_signal"] = forecast.current_field_signal;
+    result["trend_score"] = forecast.trend_score;
+    result["confidence"] = forecast.confidence;
+    result["median_distance"] = forecast.median_distance;
+    return result;
+}
+
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ numerical core for the Ocean Wave model";
     module.def("build_pairs", &build_pairs);
@@ -1001,4 +1114,7 @@ PYBIND11_MODULE(_core, module) {
     module.def("compute_short_factor", &compute_short_factor);
     module.def("blend_factors", &blend_factors);
     module.def("evolve_field", &evolve_field);
+    module.def("aggregate_surface_signals", &aggregate_surface_signals);
+    module.def("compute_stock_confirmation", &compute_stock_confirmation);
+    module.def("forecast_surface", &forecast_surface);
 }

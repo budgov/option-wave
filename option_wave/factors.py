@@ -329,6 +329,23 @@ def extract_chain_factors(
 def stock_confirmation(state: Any) -> tuple[float, float]:
     """Continuous stock-price confirmation from momentum, VWAP, and RVOL."""
 
+    if HAS_CPP_CORE and hasattr(cpp_core, "compute_stock_confirmation"):
+        def number(name: str) -> float:
+            value = getattr(state, name, None)
+            return float(value) if value is not None else np.nan
+
+        result = cpp_core.compute_stock_confirmation(
+            number("spot"),
+            number("previous_close"),
+            number("vwap"),
+            number("return_5m"),
+            number("return_15m"),
+            number("rvol"),
+            number("realized_vol"),
+            number("data_confidence"),
+        )
+        return float(result["signal"]), float(result["confidence"])
+
     components: list[float] = []
     weights: list[float] = []
     spot = float(getattr(state, "spot", 0.0))
