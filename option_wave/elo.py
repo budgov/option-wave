@@ -25,19 +25,12 @@ RatingState = MutableMapping[tuple[str, float, float], float]
 
 @dataclass
 class EloConfig:
-    """Numerical controls for the pair engine.
-
-    ``up_difficulty`` is intentionally positive and ``down_difficulty`` is
-    negative.  Thus, for the same distance d, ``up_cost > down_cost`` and a
-    downside premium has to overcome less modeled resistance.
-    """
+    """Numerical controls for the symmetric pair engine."""
 
     base_rating: float = 1500.0
     rating_scale: float = 400.0
     k_factor: float = 32.0
     distance_exponent: float = 1.0
-    up_difficulty: float = 0.35
-    down_difficulty: float = -0.35
     min_distance: float = 0.0025
     variance_floor: float = 1e-4
     variance_scale: float = 0.05
@@ -82,29 +75,23 @@ def _expiry_column(frame: pd.DataFrame) -> np.ndarray:
     return np.zeros(len(frame), dtype=float)
 
 
-def asymmetric_cost(distance: np.ndarray | float, direction: str, cfg: EloConfig | None = None) -> np.ndarray:
-    """Return the modeled energy cost for an up or down move.
-
-    The exponential term is the explicit asymmetry.  With equal premiums and
-    distance, the up cost is larger than the down cost when using defaults.
-    """
+def energy_cost(distance: np.ndarray | float, cfg: EloConfig | None = None) -> np.ndarray:
+    """Return the same distance-based energy cost for Calls and Puts."""
 
     cfg = cfg or EloConfig()
     d = np.maximum(np.asarray(distance, dtype=float), cfg.min_distance)
-    difficulty = cfg.up_difficulty if direction == "up" else cfg.down_difficulty
-    return np.power(d, cfg.distance_exponent) * np.exp(difficulty * d)
+    return np.power(d, cfg.distance_exponent)
 
 
 def energy_equalized_premium(
     price: np.ndarray | float,
     distance: np.ndarray | float,
-    direction: str,
     cfg: EloConfig | None = None,
 ) -> np.ndarray:
     """Convert an option premium into price-per-modeled-energy."""
 
     cfg = cfg or EloConfig()
-    return np.asarray(price, dtype=float) / (asymmetric_cost(distance, direction, cfg) + EPS)
+    return np.asarray(price, dtype=float) / (energy_cost(distance, cfg) + EPS)
 
 
 def _interpolate(values: np.ndarray, strikes: np.ndarray, targets: np.ndarray) -> np.ndarray:
@@ -181,8 +168,8 @@ def _build_symmetric_pairs_python(
         call_delta = _interpolate(side_call["delta"], strikes, call_strike)
         put_delta = _interpolate(side_put["delta"], strikes, put_strike)
 
-        call_force = energy_equalized_premium(call_price, distances, "up", cfg)
-        put_force = energy_equalized_premium(put_price, distances, "down", cfg)
+        call_force = energy_equalized_premium(call_price, distances, cfg)
+        put_force = energy_equalized_premium(put_price, distances, cfg)
         raw_score = call_force / (call_force + put_force + EPS)
         pair_variance = np.maximum(call_var + put_var, cfg.variance_floor)
         confidence = 1.0 / (1.0 + pair_variance / max(cfg.variance_scale, EPS))
@@ -255,8 +242,6 @@ def _build_symmetric_pairs_cpp(chain: pd.DataFrame, spot: float, cfg: EloConfig)
         float(spot),
         float(cfg.min_distance),
         float(cfg.distance_exponent),
-        float(cfg.up_difficulty),
-        float(cfg.down_difficulty),
         float(cfg.variance_floor),
         float(cfg.variance_scale),
         float(cfg.expiry_decay_days),

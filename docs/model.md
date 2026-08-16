@@ -12,25 +12,20 @@ K_c=S_t(1+d),\qquad K_p=S_t(1-d).
 Thus a `+5% Call` competes with a `-5% Put`; different expiries are never
 mixed during interpolation.
 
-Upside and downside movement resistance is dynamic:
+Both sides use the same direction-neutral distance cost:
 
 \[
-R_u(d,t)=d^p\exp(a_u(t)d),\qquad
-R_d(d,t)=d^p\exp(a_d(t)d),\qquad a_u(t)>a_d(t),
+R(d)=d^p.
 \]
 
-\[
-\begin{aligned}
-a_u(t)&=a_{u0}+0.55z_{skew}^++0.25(1-L_t)+0.20z_{short}^+,\\
-a_d(t)&=a_{d0}-0.55z_{skew}^+-0.35(1-L_t)-0.20z_{short}^+.
-\end{aligned}
-\]
+IV skew, liquidity, and short pressure remain independent evidence or risk
+modifiers; they do not alter the Call/Put energy denominator.
 
 The equalized premium forces are
 
 \[
-F_c=\frac{C(K_c,\tau,t)}{R_u(d,t)+\epsilon},\qquad
-F_p=\frac{P(K_p,\tau,t)}{R_d(d,t)+\epsilon},
+F_c=\frac{C(K_c,\tau,t)}{R(d)+\epsilon},\qquad
+F_p=\frac{P(K_p,\tau,t)}{R(d)+\epsilon},
 \]
 
 and the observed Call score is \(s=F_c/(F_c+F_p+\epsilon)\).
@@ -287,8 +282,10 @@ and the implemented explicit step is
 \boxed{\mathbf x_{n+1}=(I+\Delta t A_t)\mathbf x_n+\Delta t B_t\mathbf f_t}.
 \]
 
-The C++ kernel operates directly on contiguous arrays and integrates all
-requested horizons in one pass.
+The C++ kernel operates directly on contiguous arrays. It constructs the
+strike-expiry grid, projects the global factor signal, evolves the PDE, and
+integrates all requested horizons in one call. The Python implementation is a
+portable numerical reference rather than the production hot path.
 
 ## 10. Time integral and complete expectation
 
@@ -306,11 +303,10 @@ I_H=\int_0^H\bar\psi(t)dt,qquad \bar\psi_H=I_H/H.
 Expected log return is
 
 \[
-\mu_H=\bar\psi_H\sigma\sqrt{H/Y}\,g_\pm(t)\,a_\Gamma(t),
+\mu_H=\bar\psi_H\sigma\sqrt{H/Y}\,a_\Gamma(t),
 \]
 
-where \(g_+<g_-\) implements harder upside/easier downside and \(a_\Gamma\)
-is the GEX regime multiplier. Forecast variance is
+where \(a_\Gamma\) is the GEX regime multiplier. Forecast variance is
 
 \[
 V_H=\sigma^2\frac{H}{Y}\left[

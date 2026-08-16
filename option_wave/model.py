@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ._backend import HAS_CPP_CORE, cpp_core
-from .elo import EPS, EloConfig, asymmetric_cost, build_elo_surface, premium_sentiment_elo
+from .elo import EPS, EloConfig, build_elo_surface, energy_cost
 from .factors import (
     ChainFactorSummary,
     FactorBlend,
@@ -143,15 +143,20 @@ def _combine_indicators(values: Sequence[float], confidences: Sequence[float]) -
     )
 
 
-def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    distances = np.sort(surface["distance_pct"].unique().astype(float))
-    expiries = np.sort(surface["expiry_days"].unique().astype(float))
+def _surface_grid(
+    expiry_values: np.ndarray,
+    distance_values: np.ndarray,
+    pair_signal: np.ndarray,
+    pair_weight: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    distances = np.unique(distance_values)
+    expiries = np.unique(expiry_values)
     field_grid = np.zeros((len(expiries), len(distances)), dtype=float)
     weight_grid = np.zeros_like(field_grid)
-    expiry_index = np.searchsorted(expiries, surface["expiry_days"].to_numpy(float))
-    distance_index = np.searchsorted(distances, surface["distance_pct"].to_numpy(float))
-    field_grid[expiry_index, distance_index] = surface["pair_signal"].to_numpy(float)
-    weight_grid[expiry_index, distance_index] = surface["pair_weight"].to_numpy(float)
+    expiry_index = np.searchsorted(expiries, expiry_values)
+    distance_index = np.searchsorted(distances, distance_values)
+    field_grid[expiry_index, distance_index] = pair_signal
+    weight_grid[expiry_index, distance_index] = pair_weight
     return distances, expiries, field_grid, weight_grid
 
 
@@ -260,16 +265,6 @@ class OceanWave:
         target_signal, confidence = _combine_indicators(target_values, confidences)
         return native_signal, target_signal, confidence, tuple(symbols)
 
-    def _dynamic_elo_config(self, chain_summary: ChainFactorSummary, short_factor_pressure: float) -> EloConfig:
-        skew_stress = float(np.clip(max(chain_summary.iv_skew, 0.0) / 0.10, 0.0, 1.5))
-        liquidity_stress = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
-        short_stress = float(np.clip(max(short_factor_pressure, 0.0), 0.0, 1.0))
-        return replace(
-            self.config.elo,
-            up_difficulty=self.config.elo.up_difficulty + 0.55 * skew_stress + 0.25 * liquidity_stress + 0.20 * short_stress,
-            down_difficulty=self.config.elo.down_difficulty - 0.55 * skew_stress - 0.35 * liquidity_stress - 0.20 * short_stress,
-        )
-
     def _dynamic_pde_config(self, chain_summary: ChainFactorSummary) -> tuple[PDEConfig, float]:
         base = self.config.pde
         negative_gamma = max(-chain_summary.gex_balance, 0.0)
@@ -290,7 +285,8 @@ class OceanWave:
 
     def _factor_observations(
         self,
-        surface: pd.DataFrame,
+        premium_signal: float,
+        mean_pair_confidence: float,
         chain_summary: ChainFactorSummary,
         state: MarketState,
         short_data: ShortData | None,
@@ -298,8 +294,6 @@ class OceanWave:
         inverse_target_signal: float,
         inverse_confidence: float,
     ) -> tuple[list[float], list[float], dict[str, float]]:
-        premium_signal = premium_sentiment_elo(surface)
-        mean_pair_confidence = _weighted_mean(surface["confidence"].to_numpy(float), surface["pair_weight"].to_numpy(float))
         liquidity = float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
         premium_confidence = mean_pair_confidence * (0.40 + 0.60 * liquidity)
 
@@ -387,15 +381,32 @@ class OceanWave:
             realized_vol=state.realized_vol,
             previous_chain=previous_chain,
         )
-        preliminary_stock, _ = stock_confirmation(state)
-        preliminary_short = short_pressure(short_data, preliminary_stock)
-        elo_config = self._dynamic_elo_config(chain_summary, preliminary_short.pressure)
+        elo_config = self.config.elo
         surface = build_elo_surface(chain, state.spot, elo_config, self._ratings)
-        price_signal = 2.0 * surface["effective_score"].to_numpy(float) - 1.0
-        pair_confidence = surface["confidence"].to_numpy(float)
-        surface["pair_signal"] = pair_confidence * surface["elo_signal"].to_numpy(float) + (1.0 - pair_confidence) * price_signal
-        distances, expiries, observed, grid_weights = _surface_grid(surface)
-        current_field_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
+        expiry_values = np.ascontiguousarray(surface["expiry_days"].to_numpy(float))
+        distance_values = np.ascontiguousarray(surface["distance_pct"].to_numpy(float))
+        effective_score = np.ascontiguousarray(surface["effective_score"].to_numpy(float))
+        pair_confidence = np.ascontiguousarray(surface["confidence"].to_numpy(float))
+        elo_signal = np.ascontiguousarray(surface["elo_signal"].to_numpy(float))
+        pair_weight = np.ascontiguousarray(surface["pair_weight"].to_numpy(float))
+        pair_variance = np.ascontiguousarray(surface["pair_variance"].to_numpy(float))
+        if HAS_CPP_CORE and hasattr(cpp_core, "aggregate_surface_signals"):
+            aggregate = cpp_core.aggregate_surface_signals(
+                effective_score,
+                pair_confidence,
+                elo_signal,
+                pair_weight,
+            )
+            pair_signal = np.asarray(aggregate["pair_signal"], dtype=float)
+            premium_signal = float(aggregate["premium_signal"])
+            mean_pair_confidence = float(aggregate["mean_pair_confidence"])
+        else:
+            price_signal = 2.0 * effective_score - 1.0
+            pair_signal = pair_confidence * elo_signal + (1.0 - pair_confidence) * price_signal
+            premium_signal = _weighted_mean(elo_signal, pair_weight)
+            mean_pair_confidence = _weighted_mean(pair_confidence, pair_weight)
+        pair_signal = np.ascontiguousarray(pair_signal)
+        surface["pair_signal"] = pair_signal
 
         flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
         inverse_inputs: list[InverseMarketData] = list(inverse_markets or ())
@@ -408,7 +419,8 @@ class OceanWave:
             ))
         inverse_native, inverse_target, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
         factor_values, factor_confidences, factor_details = self._factor_observations(
-            surface,
+            premium_signal,
+            mean_pair_confidence,
             chain_summary,
             state,
             short_data,
@@ -418,26 +430,30 @@ class OceanWave:
         )
         blend: FactorBlend = adaptive_blend(factor_values, factor_confidences, self._factor_state, self.config.factors)
 
-        # B maps the global factor projection onto the strike-expiry field while
-        # preserving the ELO surface's local topology.
-        distance_basis = np.exp(-np.abs(distances) / 0.08)
-        expiry_basis = np.exp(-expiries / 45.0)
-        source_basis = expiry_basis[:, None] * distance_basis[None, :]
-        basis_mean = _weighted_mean(source_basis.ravel(), grid_weights.ravel())
-        source_basis /= max(basis_mean, EPS)
-        observed = np.clip(observed + (blend.signal - current_field_signal) * source_basis, -1.0, 1.0)
-
         horizons = tuple(sorted(set(horizons_minutes or self.config.forecast_horizons_minutes)))
         if not horizons or horizons[0] <= 0.0:
             raise ValueError("horizons_minutes must contain positive values")
         pde_config, gamma_multiplier = self._dynamic_pde_config(chain_summary)
         timestep = max(float(pde_config.timestep_minutes), 1e-3)
-        if HAS_CPP_CORE:
-            evolution = cpp_core.evolve_field(
-                np.ascontiguousarray(observed.ravel()),
-                np.ascontiguousarray(grid_weights.ravel()),
-                np.ascontiguousarray(distances),
-                np.ascontiguousarray(expiries),
+        volatility = self._volatility(chain, state, chain_summary)
+        expectations: dict[float, Expectation] = {}
+        if HAS_CPP_CORE and hasattr(cpp_core, "forecast_surface"):
+            forecast = cpp_core.forecast_surface(
+                expiry_values,
+                distance_values,
+                pair_signal,
+                pair_weight,
+                pair_variance,
+                float(blend.signal),
+                float(blend.confidence),
+                float(blend.projected_variance),
+                float(state.spot),
+                float(volatility),
+                float(chain_summary.liquidity_quality),
+                float(chain_summary.volatility_risk_premium),
+                float(pde_config.vrp_variance_scale),
+                float(gamma_multiplier),
+                float(pde_config.trading_minutes_per_year),
                 float(pde_config.distance_diffusion),
                 float(pde_config.expiry_diffusion),
                 float(pde_config.distance_drift),
@@ -446,10 +462,55 @@ class OceanWave:
                 float(timestep),
                 list(horizons),
             )
-            field_grid = np.asarray(evolution["field"], dtype=float).reshape(observed.shape)
-            integrated_values = np.asarray(evolution["integrals"], dtype=float)
-            average_values = np.asarray(evolution["averages"], dtype=float)
+            distances = np.asarray(forecast["distances"], dtype=float)
+            expiries = np.asarray(forecast["expiries"], dtype=float)
+            field_grid = np.asarray(forecast["field"], dtype=float).reshape(len(expiries), len(distances))
+            integrated_values = np.asarray(forecast["integrals"], dtype=float)
+            average_values = np.asarray(forecast["averages"], dtype=float)
+            expected_returns = np.asarray(forecast["expected_returns"], dtype=float)
+            expected_prices = np.asarray(forecast["expected_prices"], dtype=float)
+            return_variances = np.asarray(forecast["return_variances"], dtype=float)
+            price_variances = np.asarray(forecast["price_variances"], dtype=float)
+            probabilities_up = np.asarray(forecast["probabilities_up"], dtype=float)
+            for values in zip(
+                horizons,
+                integrated_values,
+                average_values,
+                expected_returns,
+                expected_prices,
+                return_variances,
+                price_variances,
+                probabilities_up,
+            ):
+                horizon, integrated, average, expected_return, expected_price, return_variance, price_variance, probability_up = values
+                expectations[float(horizon)] = Expectation(
+                    float(horizon),
+                    float(integrated),
+                    float(average),
+                    float(expected_return),
+                    float(expected_price),
+                    float(return_variance),
+                    float(price_variance),
+                    float(probability_up),
+                )
+            current_field_signal = float(forecast["current_field_signal"])
+            trend_score = float(forecast["trend_score"])
+            confidence = float(forecast["confidence"])
+            median_distance = float(forecast["median_distance"])
         else:
+            distances, expiries, observed, grid_weights = _surface_grid(
+                expiry_values,
+                distance_values,
+                pair_signal,
+                pair_weight,
+            )
+            current_field_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
+            distance_basis = np.exp(-np.abs(distances) / 0.08)
+            expiry_basis = np.exp(-expiries / 45.0)
+            source_basis = expiry_basis[:, None] * distance_basis[None, :]
+            basis_mean = _weighted_mean(source_basis.ravel(), grid_weights.ravel())
+            source_basis /= max(basis_mean, EPS)
+            observed = np.clip(observed + (blend.signal - current_field_signal) * source_basis, -1.0, 1.0)
             steps = int(np.ceil(max(horizons) / timestep))
             field_grid = observed.copy()
             scores = np.empty(steps + 1, dtype=float)
@@ -468,50 +529,46 @@ class OceanWave:
                 average_values.append(integral / max(float(elapsed[-1]), EPS))
             integrated_values = np.asarray(integrated_values)
             average_values = np.asarray(average_values)
-
-        volatility = self._volatility(chain, state, chain_summary)
-        mean_pair_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
-        liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
-        asymmetry = max(elo_config.up_difficulty - elo_config.down_difficulty, 0.0)
-        expectations: dict[float, Expectation] = {}
-        for horizon, integrated, average in zip(horizons, integrated_values, average_values):
-            integrated_value = float(integrated)
-            average_value = float(average)
-            direction_scale = 1.0 / (1.0 + 0.20 * asymmetry) if average_value >= 0.0 else 1.0 + 0.20 * asymmetry
-            year_fraction = float(horizon) / pde_config.trading_minutes_per_year
-            expected_log_return = average_value * volatility * sqrt(max(year_fraction, 0.0)) * direction_scale * gamma_multiplier
-            risk_multiplier = (
-                1.0
-                + mean_pair_variance
-                + blend.projected_variance
-                + liquidity_risk
-                + pde_config.vrp_variance_scale * abs(chain_summary.volatility_risk_premium)
-            )
-            return_variance = volatility * volatility * max(year_fraction, 0.0) * risk_multiplier
-            expected_price = state.spot * exp(expected_log_return + 0.5 * return_variance)
-            price_variance = expected_price * expected_price * np.expm1(return_variance)
-            z_score = expected_log_return / max(sqrt(return_variance), EPS)
-            expectations[float(horizon)] = Expectation(
-                float(horizon),
-                integrated_value,
-                average_value,
-                float(np.expm1(expected_log_return + 0.5 * return_variance)),
-                float(expected_price),
-                float(return_variance),
-                float(max(price_variance, 0.0)),
-                float(_normal_cdf(z_score)),
-            )
+            mean_pair_variance = _weighted_mean(pair_variance, pair_weight)
+            liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
+            for horizon, integrated, average in zip(horizons, integrated_values, average_values):
+                integrated_value = float(integrated)
+                average_value = float(average)
+                year_fraction = float(horizon) / pde_config.trading_minutes_per_year
+                expected_log_return = average_value * volatility * sqrt(max(year_fraction, 0.0)) * gamma_multiplier
+                risk_multiplier = (
+                    1.0
+                    + mean_pair_variance
+                    + blend.projected_variance
+                    + liquidity_risk
+                    + pde_config.vrp_variance_scale * abs(chain_summary.volatility_risk_premium)
+                )
+                return_variance = volatility * volatility * max(year_fraction, 0.0) * risk_multiplier
+                expected_price = state.spot * exp(expected_log_return + 0.5 * return_variance)
+                price_variance = expected_price * expected_price * np.expm1(return_variance)
+                z_score = expected_log_return / max(sqrt(return_variance), EPS)
+                expectations[float(horizon)] = Expectation(
+                    float(horizon),
+                    integrated_value,
+                    average_value,
+                    float(np.expm1(expected_log_return + 0.5 * return_variance)),
+                    float(expected_price),
+                    float(return_variance),
+                    float(max(price_variance, 0.0)),
+                    float(_normal_cdf(z_score)),
+                )
+            longest = expectations[max(expectations)]
+            trend_score = float(np.tanh(longest.average_signal))
+            confidence = float(np.clip(
+                blend.confidence
+                * (0.35 + 0.65 * chain_summary.liquidity_quality)
+                * np.exp(-blend.projected_variance),
+                0.0,
+                1.0,
+            ))
+            median_distance = float(np.median(distances))
 
         longest = expectations[max(expectations)]
-        trend_score = float(np.tanh(longest.average_signal))
-        confidence = float(np.clip(
-            blend.confidence
-            * (0.35 + 0.65 * chain_summary.liquidity_quality)
-            * np.exp(-blend.projected_variance),
-            0.0,
-            1.0,
-        ))
-        median_distance = float(np.median(distances))
         diagnostics: dict[str, object] = {
             **factor_details,
             "model_name": "Ocean Wave",
@@ -540,10 +597,7 @@ class OceanWave:
             "inverse_confidence": inverse_confidence,
             "inverse_count": float(len(inverse_symbols)),
             "inverse_symbols": ",".join(inverse_symbols),
-            "dynamic_up_difficulty": elo_config.up_difficulty,
-            "dynamic_down_difficulty": elo_config.down_difficulty,
-            "upward_cost_at_median_distance": float(asymmetric_cost(median_distance, "up", elo_config)),
-            "downward_cost_at_median_distance": float(asymmetric_cost(median_distance, "down", elo_config)),
+            "energy_cost_at_median_distance": float(energy_cost(median_distance, elo_config)),
             "expected_return": longest.expected_return,
             "probability_up": longest.probability_up,
         }

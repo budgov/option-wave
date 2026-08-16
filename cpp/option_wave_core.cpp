@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "ocean_wave_kernels.hpp"
+
 namespace py = pybind11;
 using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
 constexpr double EPS = 1e-12;
@@ -86,6 +88,13 @@ py::array_t<double> to_array(const std::vector<T>& values) {
     return result;
 }
 
+std::vector<double> to_vector(const DoubleArray& values) {
+    const auto view = values.unchecked<1>();
+    std::vector<double> result(values.size());
+    for (ssize_t i = 0; i < values.size(); ++i) result[static_cast<std::size_t>(i)] = view(i);
+    return result;
+}
+
 struct PairRow {
     double expiry_days;
     double distance_pct;
@@ -110,10 +119,9 @@ struct PairRow {
     double put_delta;
 };
 
-double asymmetric_cost(double distance, bool upside, double exponent, double up_difficulty, double down_difficulty, double min_distance) {
+double energy_cost(double distance, double exponent, double min_distance) {
     const double d = std::max(std::abs(distance), min_distance);
-    const double difficulty = upside ? up_difficulty : down_difficulty;
-    return std::pow(d, exponent) * std::exp(difficulty * d);
+    return std::pow(d, exponent);
 }
 
 py::dict pair_dict(const std::vector<PairRow>& rows) {
@@ -208,8 +216,6 @@ py::dict build_pairs(
     double spot,
     double min_distance,
     double distance_exponent,
-    double up_difficulty,
-    double down_difficulty,
     double variance_floor,
     double variance_scale,
     double expiry_decay_days
@@ -298,10 +304,9 @@ py::dict build_pairs(
             const double poi = interpolate(x, p_oi, put_strike);
             const double cd = interpolate(x, c_delta, call_strike);
             const double pd = interpolate(x, p_delta, put_strike);
-            const double call_cost = asymmetric_cost(distance, true, distance_exponent, up_difficulty, down_difficulty, min_distance);
-            const double put_cost = asymmetric_cost(distance, false, distance_exponent, up_difficulty, down_difficulty, min_distance);
-            const double cf = cp / (call_cost + EPS);
-            const double pf = pp / (put_cost + EPS);
+            const double pair_cost = energy_cost(distance, distance_exponent, min_distance);
+            const double cf = cp / (pair_cost + EPS);
+            const double pf = pp / (pair_cost + EPS);
             const double raw = cf / (cf + pf + EPS);
             const double pair_var = std::max(cv + pv, variance_floor);
             const double pair_confidence = 1.0 / (1.0 + pair_var / std::max(variance_scale, EPS));
@@ -863,75 +868,60 @@ py::dict blend_factors(
     return result;
 }
 
-double weighted_mean(const std::vector<double>& values, const std::vector<double>& weights) {
-    double numerator = 0.0;
-    double denominator = 0.0;
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        const double weight = std::max(weights[i], EPS);
-        numerator += values[i] * weight;
-        denominator += weight;
-    }
-    return denominator > EPS ? numerator / denominator : 0.0;
+py::dict aggregate_surface_signals(
+    const DoubleArray& effective_score,
+    const DoubleArray& confidence,
+    const DoubleArray& elo_signal,
+    const DoubleArray& pair_weight
+) {
+    const ocean_wave::SurfaceAggregate aggregate = ocean_wave::aggregate_surface(
+        to_vector(effective_score),
+        to_vector(confidence),
+        to_vector(elo_signal),
+        to_vector(pair_weight)
+    );
+    py::dict result;
+    result["pair_signal"] = to_array(aggregate.pair_signal);
+    result["premium_signal"] = aggregate.premium_signal;
+    result["mean_pair_confidence"] = aggregate.mean_pair_confidence;
+    return result;
 }
 
-void gradient_axis(const std::vector<double>& field, int rows, int cols, const std::vector<double>& coordinates, int axis, std::vector<double>& output) {
-    output.assign(field.size(), 0.0);
-    if ((axis == 0 && rows < 2) || (axis == 1 && cols < 2)) return;
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            const int index = row * cols + col;
-            if (axis == 1) {
-                if (col == 0) {
-                    const double span = coordinates[1] - coordinates[0];
-                    output[index] = span > EPS ? (field[row * cols + 1] - field[index]) / span : 0.0;
-                } else if (col == cols - 1) {
-                    const double span = coordinates[cols - 1] - coordinates[cols - 2];
-                    output[index] = span > EPS ? (field[index] - field[row * cols + cols - 2]) / span : 0.0;
-                } else {
-                    const double left_span = coordinates[col] - coordinates[col - 1];
-                    const double right_span = coordinates[col + 1] - coordinates[col];
-                    const double denominator = left_span * right_span * (left_span + right_span);
-                    output[index] = denominator > EPS
-                        ? (-right_span * right_span * field[row * cols + col - 1]
-                           + (right_span * right_span - left_span * left_span) * field[index]
-                           + left_span * left_span * field[row * cols + col + 1]) / denominator
-                        : 0.0;
-                }
-            } else {
-                if (row == 0) {
-                    const double span = coordinates[1] - coordinates[0];
-                    output[index] = span > EPS ? (field[cols + col] - field[index]) / span : 0.0;
-                } else if (row == rows - 1) {
-                    const double span = coordinates[rows - 1] - coordinates[rows - 2];
-                    output[index] = span > EPS ? (field[index] - field[(rows - 2) * cols + col]) / span : 0.0;
-                } else {
-                    const double top_span = coordinates[row] - coordinates[row - 1];
-                    const double bottom_span = coordinates[row + 1] - coordinates[row];
-                    const double denominator = top_span * bottom_span * (top_span + bottom_span);
-                    output[index] = denominator > EPS
-                        ? (-bottom_span * bottom_span * field[(row - 1) * cols + col]
-                           + (bottom_span * bottom_span - top_span * top_span) * field[index]
-                           + top_span * top_span * field[(row + 1) * cols + col]) / denominator
-                        : 0.0;
-                }
-            }
-        }
-    }
+py::dict compute_stock_confirmation(
+    double spot,
+    double previous_close,
+    double vwap,
+    double return_5m,
+    double return_15m,
+    double rvol,
+    double realized_vol,
+    double data_confidence
+) {
+    const ocean_wave::StockConfirmation confirmation = ocean_wave::stock_confirmation(
+        spot, previous_close, vwap, return_5m, return_15m, rvol, realized_vol, data_confidence
+    );
+    py::dict result;
+    result["signal"] = confirmation.signal;
+    result["confidence"] = confirmation.confidence;
+    return result;
 }
 
-std::vector<double> laplacian_axis(const std::vector<double>& field, int rows, int cols, const std::vector<double>& coordinates, int axis) {
-    std::vector<double> gradient;
-    std::vector<double> laplacian;
-    gradient_axis(field, rows, cols, coordinates, axis, gradient);
-    gradient_axis(gradient, rows, cols, coordinates, axis, laplacian);
-    return laplacian;
-}
-
-py::dict evolve_field(
-    const DoubleArray& observed_array,
-    const DoubleArray& weights_array,
-    const DoubleArray& distances_array,
-    const DoubleArray& expiries_array,
+py::dict forecast_surface(
+    const DoubleArray& row_expiry,
+    const DoubleArray& row_distance,
+    const DoubleArray& row_pair_signal,
+    const DoubleArray& row_pair_weight,
+    const DoubleArray& row_pair_variance,
+    double composite_signal,
+    double composite_confidence,
+    double projected_factor_variance,
+    double spot,
+    double volatility,
+    double liquidity_quality,
+    double volatility_risk_premium,
+    double vrp_variance_scale,
+    double gamma_multiplier,
+    double trading_minutes_per_year,
     double distance_diffusion,
     double expiry_diffusion,
     double distance_drift,
@@ -940,58 +930,45 @@ py::dict evolve_field(
     double timestep_minutes,
     const std::vector<double>& horizons
 ) {
-    const auto observed_view = observed_array.unchecked<1>();
-    const auto weights_view = weights_array.unchecked<1>();
-    const auto distance_view = distances_array.unchecked<1>();
-    const auto expiry_view = expiries_array.unchecked<1>();
-    const int rows = static_cast<int>(expiries_array.size());
-    const int cols = static_cast<int>(distances_array.size());
-    const int size = rows * cols;
-    if (observed_array.size() != size || weights_array.size() != size) throw std::runtime_error("field arrays have incompatible shapes");
-    const double dt = std::max(timestep_minutes, 1e-6);
-    const double max_horizon = *std::max_element(horizons.begin(), horizons.end());
-    const int steps = static_cast<int>(std::ceil(max_horizon / dt));
-    std::vector<double> distances(cols), expiries(rows), observed(size), weights(size), field(size), next(size), scores(steps + 1);
-    for (int i = 0; i < cols; ++i) distances[i] = distance_view(i);
-    for (int i = 0; i < rows; ++i) expiries[i] = expiry_view(i);
-    for (int i = 0; i < size; ++i) {
-        observed[i] = observed_view(i);
-        weights[i] = weights_view(i);
-        field[i] = observed[i];
-    }
-    scores[0] = weighted_mean(field, weights);
-    for (int step = 1; step <= steps; ++step) {
-        const std::vector<double> lap_distance = laplacian_axis(field, rows, cols, distances, 1);
-        const std::vector<double> lap_expiry = laplacian_axis(field, rows, cols, expiries, 0);
-        std::vector<double> gradient_distance;
-        gradient_axis(field, rows, cols, distances, 1, gradient_distance);
-        for (int i = 0; i < size; ++i) {
-            const double derivative = -distance_drift * gradient_distance[i]
-                + distance_diffusion * lap_distance[i]
-                + expiry_diffusion * lap_expiry[i]
-                - decay * field[i]
-                + source_strength * (observed[i] - field[i]);
-            next[i] = std::max(-1.0, std::min(1.0, field[i] + dt * derivative));
-        }
-        field.swap(next);
-        scores[step] = weighted_mean(field, weights);
-    }
-    std::vector<double> integrals, averages;
-    integrals.reserve(horizons.size());
-    averages.reserve(horizons.size());
-    for (const double horizon : horizons) {
-        const int index = std::min(steps, static_cast<int>(std::ceil(horizon / dt)));
-        double integral = 0.0;
-        for (int i = 1; i <= index; ++i) integral += 0.5 * (scores[i] + scores[i - 1]) * dt;
-        const double elapsed = std::max(index * dt, EPS);
-        integrals.push_back(integral);
-        averages.push_back(integral / elapsed);
-    }
+    const ocean_wave::Forecast forecast = ocean_wave::forecast_surface(
+        to_vector(row_expiry),
+        to_vector(row_distance),
+        to_vector(row_pair_signal),
+        to_vector(row_pair_weight),
+        to_vector(row_pair_variance),
+        composite_signal,
+        composite_confidence,
+        projected_factor_variance,
+        spot,
+        volatility,
+        liquidity_quality,
+        volatility_risk_premium,
+        vrp_variance_scale,
+        gamma_multiplier,
+        trading_minutes_per_year,
+        distance_diffusion,
+        expiry_diffusion,
+        distance_drift,
+        decay,
+        source_strength,
+        timestep_minutes,
+        horizons
+    );
     py::dict result;
-    result["field"] = to_array(field);
-    result["scores"] = to_array(scores);
-    result["integrals"] = to_array(integrals);
-    result["averages"] = to_array(averages);
+    result["distances"] = to_array(forecast.distances);
+    result["expiries"] = to_array(forecast.expiries);
+    result["field"] = to_array(forecast.field);
+    result["integrals"] = to_array(forecast.integrals);
+    result["averages"] = to_array(forecast.averages);
+    result["expected_returns"] = to_array(forecast.expected_returns);
+    result["expected_prices"] = to_array(forecast.expected_prices);
+    result["return_variances"] = to_array(forecast.return_variances);
+    result["price_variances"] = to_array(forecast.price_variances);
+    result["probabilities_up"] = to_array(forecast.probabilities_up);
+    result["current_field_signal"] = forecast.current_field_signal;
+    result["trend_score"] = forecast.trend_score;
+    result["confidence"] = forecast.confidence;
+    result["median_distance"] = forecast.median_distance;
     return result;
 }
 
@@ -1004,5 +981,7 @@ PYBIND11_MODULE(_core, module) {
     module.def("extract_chain_factors", &extract_chain_factors);
     module.def("compute_short_factor", &compute_short_factor);
     module.def("blend_factors", &blend_factors);
-    module.def("evolve_field", &evolve_field);
+    module.def("aggregate_surface_signals", &aggregate_surface_signals);
+    module.def("compute_stock_confirmation", &compute_stock_confirmation);
+    module.def("forecast_surface", &forecast_surface);
 }
