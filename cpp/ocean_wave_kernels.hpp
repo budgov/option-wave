@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -95,54 +94,67 @@ inline StockConfirmation stock_confirmation(
     };
 }
 
-inline void gradient_axis(
+struct GradientStencil {
+    int axis = 0;
+    std::vector<double> lower;
+    std::vector<double> center;
+    std::vector<double> upper;
+};
+
+inline GradientStencil make_gradient_stencil(const std::vector<double>& coordinates, int axis) {
+    GradientStencil stencil;
+    stencil.axis = axis;
+    const std::size_t length = coordinates.size();
+    stencil.lower.assign(length, 0.0);
+    stencil.center.assign(length, 0.0);
+    stencil.upper.assign(length, 0.0);
+    if (length < 2) return stencil;
+    const double first_span = coordinates[1] - coordinates[0];
+    if (first_span > EPSILON) {
+        stencil.center[0] = -1.0 / first_span;
+        stencil.upper[0] = 1.0 / first_span;
+    }
+    const double last_span = coordinates[length - 1] - coordinates[length - 2];
+    if (last_span > EPSILON) {
+        stencil.lower[length - 1] = -1.0 / last_span;
+        stencil.center[length - 1] = 1.0 / last_span;
+    }
+    for (std::size_t position = 1; position + 1 < length; ++position) {
+        const double left_span = coordinates[position] - coordinates[position - 1];
+        const double right_span = coordinates[position + 1] - coordinates[position];
+        const double denominator = left_span * right_span * (left_span + right_span);
+        if (denominator <= EPSILON) continue;
+        stencil.lower[position] = -right_span * right_span / denominator;
+        stencil.center[position] = (right_span * right_span - left_span * left_span) / denominator;
+        stencil.upper[position] = left_span * left_span / denominator;
+    }
+    return stencil;
+}
+
+inline void apply_gradient(
     const std::vector<double>& field,
     int rows,
     int cols,
-    const std::vector<double>& coordinates,
-    int axis,
+    const GradientStencil& stencil,
     std::vector<double>& output
 ) {
-    output.assign(field.size(), 0.0);
-    if ((axis == 0 && rows < 2) || (axis == 1 && cols < 2)) return;
+    if (output.size() != field.size()) output.resize(field.size());
+    const int length = stencil.axis == 1 ? cols : rows;
+    if (length < 2) {
+        std::fill(output.begin(), output.end(), 0.0);
+        return;
+    }
+    const int stride = stencil.axis == 1 ? 1 : cols;
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
             const int index = row * cols + col;
-            const int position = axis == 1 ? col : row;
-            const int length = axis == 1 ? cols : rows;
-            const int stride = axis == 1 ? 1 : cols;
-            if (position == 0) {
-                const double span = coordinates[1] - coordinates[0];
-                output[index] = span > EPSILON ? (field[index + stride] - field[index]) / span : 0.0;
-            } else if (position == length - 1) {
-                const double span = coordinates[length - 1] - coordinates[length - 2];
-                output[index] = span > EPSILON ? (field[index] - field[index - stride]) / span : 0.0;
-            } else {
-                const double left_span = coordinates[position] - coordinates[position - 1];
-                const double right_span = coordinates[position + 1] - coordinates[position];
-                const double denominator = left_span * right_span * (left_span + right_span);
-                output[index] = denominator > EPSILON
-                    ? (-right_span * right_span * field[index - stride]
-                       + (right_span * right_span - left_span * left_span) * field[index]
-                       + left_span * left_span * field[index + stride]) / denominator
-                    : 0.0;
-            }
+            const int position = stencil.axis == 1 ? col : row;
+            double value = stencil.center[position] * field[index];
+            if (position > 0) value += stencil.lower[position] * field[index - stride];
+            if (position + 1 < length) value += stencil.upper[position] * field[index + stride];
+            output[index] = value;
         }
     }
-}
-
-inline std::vector<double> laplacian_axis(
-    const std::vector<double>& field,
-    int rows,
-    int cols,
-    const std::vector<double>& coordinates,
-    int axis
-) {
-    std::vector<double> gradient;
-    std::vector<double> laplacian;
-    gradient_axis(field, rows, cols, coordinates, axis, gradient);
-    gradient_axis(gradient, rows, cols, coordinates, axis, laplacian);
-    return laplacian;
 }
 
 struct Evolution {
@@ -176,12 +188,18 @@ inline Evolution evolve(
     std::vector<double> field = observed;
     std::vector<double> next(size);
     std::vector<double> scores(steps + 1);
+    std::vector<double> gradient_scratch(size);
+    std::vector<double> gradient_distance(size);
+    std::vector<double> lap_distance(size);
+    std::vector<double> lap_expiry(size);
+    const GradientStencil distance_stencil = make_gradient_stencil(distances, 1);
+    const GradientStencil expiry_stencil = make_gradient_stencil(expiries, 0);
     scores[0] = weighted_mean(field, weights);
     for (int step = 1; step <= steps; ++step) {
-        const std::vector<double> lap_distance = laplacian_axis(field, rows, cols, distances, 1);
-        const std::vector<double> lap_expiry = laplacian_axis(field, rows, cols, expiries, 0);
-        std::vector<double> gradient_distance;
-        gradient_axis(field, rows, cols, distances, 1, gradient_distance);
+        apply_gradient(field, rows, cols, distance_stencil, gradient_distance);
+        apply_gradient(gradient_distance, rows, cols, distance_stencil, lap_distance);
+        apply_gradient(field, rows, cols, expiry_stencil, gradient_scratch);
+        apply_gradient(gradient_scratch, rows, cols, expiry_stencil, lap_expiry);
         for (int i = 0; i < size; ++i) {
             const double derivative = -distance_drift * gradient_distance[i]
                 + distance_diffusion * lap_distance[i]
@@ -274,10 +292,17 @@ inline Forecast forecast_surface(
     }
     result.current_field_signal = weighted_mean(observed, weights);
     std::vector<double> source_basis(size);
+    std::vector<double> distance_basis(cols);
+    std::vector<double> expiry_basis(rows);
+    for (int col = 0; col < cols; ++col) {
+        distance_basis[col] = std::exp(-std::abs(result.distances[col]) / 0.08);
+    }
+    for (int row = 0; row < rows; ++row) {
+        expiry_basis[row] = std::exp(-result.expiries[row] / 45.0);
+    }
     for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
-            source_basis[row * cols + col] = std::exp(-std::abs(result.distances[col]) / 0.08)
-                * std::exp(-result.expiries[row] / 45.0);
+            source_basis[row * cols + col] = distance_basis[col] * expiry_basis[row];
         }
     }
     const double basis_mean = std::max(weighted_mean(source_basis, weights), EPSILON);

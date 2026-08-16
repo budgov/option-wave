@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ._backend import HAS_CPP_CORE, cpp_core
-from .elo import EPS, EloConfig, build_elo_surface, energy_cost, premium_sentiment_elo
+from .elo import EPS, EloConfig, build_elo_surface, energy_cost
 from .factors import (
     ChainFactorSummary,
     FactorBlend,
@@ -143,15 +143,20 @@ def _combine_indicators(values: Sequence[float], confidences: Sequence[float]) -
     )
 
 
-def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    distances = np.sort(surface["distance_pct"].unique().astype(float))
-    expiries = np.sort(surface["expiry_days"].unique().astype(float))
+def _surface_grid(
+    expiry_values: np.ndarray,
+    distance_values: np.ndarray,
+    pair_signal: np.ndarray,
+    pair_weight: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    distances = np.unique(distance_values)
+    expiries = np.unique(expiry_values)
     field_grid = np.zeros((len(expiries), len(distances)), dtype=float)
     weight_grid = np.zeros_like(field_grid)
-    expiry_index = np.searchsorted(expiries, surface["expiry_days"].to_numpy(float))
-    distance_index = np.searchsorted(distances, surface["distance_pct"].to_numpy(float))
-    field_grid[expiry_index, distance_index] = surface["pair_signal"].to_numpy(float)
-    weight_grid[expiry_index, distance_index] = surface["pair_weight"].to_numpy(float)
+    expiry_index = np.searchsorted(expiries, expiry_values)
+    distance_index = np.searchsorted(distances, distance_values)
+    field_grid[expiry_index, distance_index] = pair_signal
+    weight_grid[expiry_index, distance_index] = pair_weight
     return distances, expiries, field_grid, weight_grid
 
 
@@ -280,7 +285,6 @@ class OceanWave:
 
     def _factor_observations(
         self,
-        surface: pd.DataFrame,
         premium_signal: float,
         mean_pair_confidence: float,
         chain_summary: ChainFactorSummary,
@@ -379,25 +383,30 @@ class OceanWave:
         )
         elo_config = self.config.elo
         surface = build_elo_surface(chain, state.spot, elo_config, self._ratings)
+        expiry_values = np.ascontiguousarray(surface["expiry_days"].to_numpy(float))
+        distance_values = np.ascontiguousarray(surface["distance_pct"].to_numpy(float))
+        effective_score = np.ascontiguousarray(surface["effective_score"].to_numpy(float))
+        pair_confidence = np.ascontiguousarray(surface["confidence"].to_numpy(float))
+        elo_signal = np.ascontiguousarray(surface["elo_signal"].to_numpy(float))
+        pair_weight = np.ascontiguousarray(surface["pair_weight"].to_numpy(float))
+        pair_variance = np.ascontiguousarray(surface["pair_variance"].to_numpy(float))
         if HAS_CPP_CORE and hasattr(cpp_core, "aggregate_surface_signals"):
             aggregate = cpp_core.aggregate_surface_signals(
-                np.ascontiguousarray(surface["effective_score"].to_numpy(float)),
-                np.ascontiguousarray(surface["confidence"].to_numpy(float)),
-                np.ascontiguousarray(surface["elo_signal"].to_numpy(float)),
-                np.ascontiguousarray(surface["pair_weight"].to_numpy(float)),
+                effective_score,
+                pair_confidence,
+                elo_signal,
+                pair_weight,
             )
-            surface["pair_signal"] = np.asarray(aggregate["pair_signal"], dtype=float)
+            pair_signal = np.asarray(aggregate["pair_signal"], dtype=float)
             premium_signal = float(aggregate["premium_signal"])
             mean_pair_confidence = float(aggregate["mean_pair_confidence"])
         else:
-            price_signal = 2.0 * surface["effective_score"].to_numpy(float) - 1.0
-            pair_confidence = surface["confidence"].to_numpy(float)
-            surface["pair_signal"] = pair_confidence * surface["elo_signal"].to_numpy(float) + (1.0 - pair_confidence) * price_signal
-            premium_signal = premium_sentiment_elo(surface)
-            mean_pair_confidence = _weighted_mean(
-                surface["confidence"].to_numpy(float),
-                surface["pair_weight"].to_numpy(float),
-            )
+            price_signal = 2.0 * effective_score - 1.0
+            pair_signal = pair_confidence * elo_signal + (1.0 - pair_confidence) * price_signal
+            premium_signal = _weighted_mean(elo_signal, pair_weight)
+            mean_pair_confidence = _weighted_mean(pair_confidence, pair_weight)
+        pair_signal = np.ascontiguousarray(pair_signal)
+        surface["pair_signal"] = pair_signal
 
         flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
         inverse_inputs: list[InverseMarketData] = list(inverse_markets or ())
@@ -410,7 +419,6 @@ class OceanWave:
             ))
         inverse_native, inverse_target, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
         factor_values, factor_confidences, factor_details = self._factor_observations(
-            surface,
             premium_signal,
             mean_pair_confidence,
             chain_summary,
@@ -431,11 +439,11 @@ class OceanWave:
         expectations: dict[float, Expectation] = {}
         if HAS_CPP_CORE and hasattr(cpp_core, "forecast_surface"):
             forecast = cpp_core.forecast_surface(
-                np.ascontiguousarray(surface["expiry_days"].to_numpy(float)),
-                np.ascontiguousarray(surface["distance_pct"].to_numpy(float)),
-                np.ascontiguousarray(surface["pair_signal"].to_numpy(float)),
-                np.ascontiguousarray(surface["pair_weight"].to_numpy(float)),
-                np.ascontiguousarray(surface["pair_variance"].to_numpy(float)),
+                expiry_values,
+                distance_values,
+                pair_signal,
+                pair_weight,
+                pair_variance,
                 float(blend.signal),
                 float(blend.confidence),
                 float(blend.projected_variance),
@@ -490,7 +498,12 @@ class OceanWave:
             confidence = float(forecast["confidence"])
             median_distance = float(forecast["median_distance"])
         else:
-            distances, expiries, observed, grid_weights = _surface_grid(surface)
+            distances, expiries, observed, grid_weights = _surface_grid(
+                expiry_values,
+                distance_values,
+                pair_signal,
+                pair_weight,
+            )
             current_field_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
             distance_basis = np.exp(-np.abs(distances) / 0.08)
             expiry_basis = np.exp(-expiries / 45.0)
@@ -516,7 +529,7 @@ class OceanWave:
                 average_values.append(integral / max(float(elapsed[-1]), EPS))
             integrated_values = np.asarray(integrated_values)
             average_values = np.asarray(average_values)
-            mean_pair_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
+            mean_pair_variance = _weighted_mean(pair_variance, pair_weight)
             liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
             for horizon, integrated, average in zip(horizons, integrated_values, average_values):
                 integrated_value = float(integrated)
