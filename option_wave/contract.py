@@ -366,7 +366,7 @@ def assess_contract(
 
     The continuous score penalizes wide spreads and high daily theta burn. It
     intentionally does not claim an executable edge or fit thresholds from an
-    unverified Telegram outcome.
+    unverified external outcome.
     """
 
     contract = contract or {}

@@ -1,63 +1,10 @@
-# Local dependencies and reproducible build products
-node_modules/
 .venv/
-build/
-work/
-bin/
-*.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-coverage/
-.coverage*
-htmlcov/
-
-# Runtime state, private evidence, and generated reports
-data/
-logs/
-outputs/
-.secrets/
-config.json
-.env
-.env.*
-!.env.example
-*.db
-*.db-*
-*.sqlite
-*.sqlite-*
-*.wal
-*.shm
-*.log
-*.pid
-*.lock
-agents/*/openclaw-workspace-state.json
-
-# Credentials and browser/account exports
-*.pem
-*.key
-*.pfx
-*.p12
-*.cookies
-cookies.json
-session.json
-
-# Native binaries and compiler intermediates
-*.exe
-*.dll
-*.lib
-*.obj
-*.pdb
-*.exp
+*.png
 *.so
 *.dylib
 *.pyd
-
-# Editor and Windows filesystem noise
-.idea/
-.vscode/
-*.swp
-*.tmp
-Thumbs.db
-Desktop.ini
+build/
+*.egg-info/

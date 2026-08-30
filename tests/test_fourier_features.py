@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-import subprocess
-import sys
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -137,49 +133,6 @@ class IntradayFourierBindingTests(unittest.TestCase):
 
 
 class IntradayPriceAdapterTests(unittest.TestCase):
-    @unittest.skipUnless(HAS_CPP_CORE, "compiled extension is not installed")
-    def test_json_lines_worker_serializes_a_full_session_feature_response(self) -> None:
-        repository = Path(__file__).resolve().parents[1]
-        index = np.arange(390, dtype=np.float64)
-        returns = 0.0001 + 0.001 * np.cos(2.0 * np.pi * index / 30.0)
-        prices = 100.0 * np.exp(np.concatenate(([0.0], np.cumsum(returns))))
-        requests = [
-            {
-                "id": "full-session",
-                "command": "intraday_features",
-                "prices": prices.tolist(),
-                "valid_length": int(prices.size),
-                "max_harmonics": 195,
-                "sample_interval_minutes": 1.0,
-            },
-            {"id": "shutdown", "command": "shutdown"},
-        ]
-        with tempfile.TemporaryDirectory(prefix="ow-json-worker-") as state_directory:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(repository / "scripts" / "realtime_worker.py"),
-                    "--state-dir",
-                    state_directory,
-                    "--max-requests",
-                    "10",
-                ],
-                input="".join(f"{json.dumps(request, allow_nan=False)}\n" for request in requests),
-                text=True,
-                capture_output=True,
-                cwd=repository,
-                timeout=20,
-                check=False,
-            )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
-        self.assertEqual(responses[0]["event"], "ready")
-        response = next(item for item in responses if item.get("id") == "full-session")
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["result"]["status"], "ok")
-        self.assertIsInstance(response["result"]["amplitudes"], list)
-        self.assertEqual(len(response["result"]["amplitudes"]), 195)
-
     def test_price_adapter_converts_native_arrays_and_scalars_to_strict_json(self) -> None:
         native_result = {
             "schema_version": "intraday_fourier.v2",

@@ -6,10 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "ocean-wave"
 version = "1.0.0"
 description = "C++ accelerated multi-factor option-surface and continuous-wave forecasting model"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.26",
   "pandas>=2.0",
+  "matplotlib>=3.8",
 ]
 
 [tool.setuptools]

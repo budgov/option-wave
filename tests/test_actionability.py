@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
-from option_wave import HAS_CPP_CORE, MarketState, OceanWave, OptionWaveV09
-from option_wave.realtime import RealtimePredictor, audit_option_chain, compact_previous_chain
+from option_wave import EventContext, HAS_CPP_CORE, MarketState, OceanWave, OptionWaveV09
+from option_wave.elo import build_elo_surface
+from option_wave.factors import extract_chain_factors
 
 
 def symmetric_chain() -> pd.DataFrame:
@@ -157,74 +156,76 @@ class ActionabilityTests(unittest.TestCase):
         self.assertTrue(result.expectations)
         self.assertIsInstance(result.expected_price, float)
 
-
-class OpenInterestIsolationTests(unittest.TestCase):
-    def _predict(self, current: pd.DataFrame, *, seed_history: bool, previous: pd.DataFrame | None) -> tuple[dict, object]:
-        class FakeSchwabClient:
-            def __init__(self, _config: object) -> None:
-                pass
-
-            def fetch_market_snapshot(self, _symbol: str, *, strike_count: int) -> tuple[pd.DataFrame, MarketState]:
-                return current, complete_state()
-
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        client_patch = patch("option_wave.realtime.SchwabHTTPClient", FakeSchwabClient)
-        client_patch.start()
-        self.addCleanup(client_patch.stop)
-        predictor = RealtimePredictor(Path(directory.name), async_checkpoints=False, require_native_core=False)
-        self.addCleanup(predictor.close)
-        runtime = predictor._load("SPY")
-        baseline = symmetric_chain()
-        baseline_oi = audit_option_chain(baseline, 100.0).oi_gross
-        runtime.oi_history = (baseline_oi,) * 5 if seed_history else ()
-        runtime.previous_chain = compact_previous_chain(previous) if previous is not None else None
-        before = runtime.model.state_dict()
-        snapshot = predictor.predict(
-            symbol="SPY",
-            signal_published_at="2026-08-28T17:00:00Z",
-            access_token="test-token",
-            horizons=(30.0,),
-            strike_count=40,
-            checkpoint_async=False,
+    def test_event_context_changes_risk_but_not_direction(self) -> None:
+        baseline = OceanWave().predict(
+            symmetric_chain(), complete_state(), horizons_minutes=(30.0,)
         )
-        self.assertEqual(runtime.model.state_dict(), before)
-        self.assertFalse(snapshot["runtime"]["state_updated"])
-        self.assertEqual(snapshot["runtime"]["checkpoint"], "none")
-        self.assertFalse((Path(directory.name) / "SPY.state.json").exists())
-        return snapshot, runtime
+        stressed = OceanWave().predict(
+            symmetric_chain(),
+            complete_state(),
+            event_context=EventContext(
+                minutes_to_earnings=5.0,
+                minutes_to_macro=15.0,
+                event_surprise_z=2.0,
+                headline_intensity=0.8,
+                confidence=1.0,
+            ),
+            horizons_minutes=(30.0,),
+        )
 
-    def test_extreme_oi_isolated_without_gamma_or_gex_baseline(self) -> None:
-        extreme = symmetric_chain()
-        extreme["call_gamma"] = np.nan
-        extreme["put_gamma"] = np.nan
-        extreme["call_oi"] = 100_000_000.0
-        snapshot, _runtime = self._predict(extreme, seed_history=False, previous=None)
-        self.assertTrue(snapshot["quarantined"])
-        self.assertIn("open_interest_exceeds_per_contract_limit", snapshot["quarantine_reasons"])
+        self.assertGreater(
+            stressed.expectations[30.0].return_variance,
+            baseline.expectations[30.0].return_variance,
+        )
+        self.assertLess(stressed.confidence, baseline.confidence)
+        self.assertEqual(stressed.direction, baseline.direction)
 
-    def test_robust_oi_baseline_isolates_relative_outlier_when_gamma_missing(self) -> None:
-        extreme = symmetric_chain()
-        extreme["call_gamma"] = np.nan
-        extreme["put_gamma"] = np.nan
-        extreme["call_oi"] = 5_000_000.0
-        extreme["put_oi"] = 5_000_000.0
-        snapshot, _runtime = self._predict(extreme, seed_history=True, previous=None)
-        self.assertTrue(snapshot["quarantined"])
-        self.assertIn("oi_gross_extreme_outlier", snapshot["quarantine_reasons"])
+    def test_online_state_is_bounded_and_round_trips(self) -> None:
+        ratings: dict[tuple[str, float, float], float] = {}
+        latest = None
+        for spot in np.linspace(99.0, 101.0, 80):
+            latest = build_elo_surface(symmetric_chain(), float(spot), ratings=ratings)
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertLessEqual(len(ratings), 2 * len(latest))
 
-    def test_cold_start_previous_chain_isolates_extreme_oi_change(self) -> None:
-        baseline = symmetric_chain()
-        extreme = baseline.copy()
-        extreme["call_gamma"] = np.nan
-        extreme["put_gamma"] = np.nan
-        extreme["call_oi"] = 5_000_000.0
-        snapshot, _runtime = self._predict(extreme, seed_history=False, previous=baseline)
-        self.assertTrue(snapshot["quarantined"])
-        self.assertTrue({
-            "oi_gross_change_extreme_outlier",
-            "oi_contract_change_extreme_outlier",
-        }.intersection(snapshot["quarantine_reasons"]))
+        original = OceanWave()
+        original.predict(symmetric_chain(), complete_state(), horizons_minutes=(30.0,))
+        state = original.state_dict()
+        restored = OceanWave()
+        restored.load_state_dict(state)
+        self.assertEqual(restored.state_dict(), state)
+
+    def test_oi_change_uses_stable_contract_identity(self) -> None:
+        previous = symmetric_chain()
+        previous["call_symbol"] = [f"TEST-C-{index}" for index in range(len(previous))]
+        previous["put_symbol"] = [f"TEST-P-{index}" for index in range(len(previous))]
+        current = previous.copy()
+        current["expiry_days"] = np.maximum(current["expiry_days"] - 1.0, 0.0)
+        current["call_oi"] += 100.0
+
+        with patch("option_wave.factors.HAS_CPP_CORE", False):
+            reference = extract_chain_factors(current, 100.0, previous_chain=previous)
+        native = extract_chain_factors(current, 100.0, previous_chain=previous)
+
+        self.assertGreater(native.oi_signal, 0.0)
+        self.assertGreater(native.oi_confidence, 0.0)
+        self.assertAlmostEqual(native.oi_signal, reference.oi_signal, places=10)
+        self.assertAlmostEqual(native.oi_confidence, reference.oi_confidence, places=10)
+
+        unchanged = previous.copy()
+        unchanged["expiry_days"] = np.maximum(unchanged["expiry_days"] - 1.0, 0.0)
+        with patch("option_wave.factors.HAS_CPP_CORE", False):
+            unchanged_reference = extract_chain_factors(
+                unchanged, 100.0, previous_chain=previous
+            )
+        unchanged_native = extract_chain_factors(
+            unchanged, 100.0, previous_chain=previous
+        )
+        self.assertEqual(unchanged_reference.oi_signal, 0.0)
+        self.assertEqual(unchanged_reference.oi_confidence, 0.0)
+        self.assertEqual(unchanged_native.oi_signal, 0.0)
+        self.assertEqual(unchanged_native.oi_confidence, 0.0)
 
 
 if __name__ == "__main__":

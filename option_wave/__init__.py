@@ -22,7 +22,6 @@ from .model import (
     PDEConfig,
 )
 from .http_api import HTTPAPIConfig, HTTPAPIError, MarketBundle, MassiveHTTPClient
-from .schwab_api import SchwabHTTPClient, SchwabHTTPConfig
 from .contract import ContractAssessment, assess_contract
 
 __all__ = [
@@ -51,8 +50,6 @@ __all__ = [
     "HTTPAPIError",
     "MarketBundle",
     "MassiveHTTPClient",
-    "SchwabHTTPClient",
-    "SchwabHTTPConfig",
     "InverseLink",
     "InverseMarketData",
     "InverseRegistry",

@@ -3,30 +3,6 @@
 The live boundary is broker-neutral and web-only. Use HTTPS/WebSocket market
 data APIs; do not add moomoo/OpenD or a desktop application dependency.
 
-## Historical point-in-time option backtests
-
-`MassiveHTTPClient.fetch_option_quotes()` and `fetch_option_trades()` accept a
-bounded start/end window for one exact OCC option ticker. Historical quote rows
-preserve OPRA timestamps, sizes, exchanges, sequence numbers, bid/ask, mid,
-spread, and an `executable` quality flag. Crossed or incomplete markets stay in
-the audit trail but are never substituted with last trades or theoretical values.
-
-For a long option, enter at the first reliable ask at/after the signal timestamp
-and exit at a reliable bid. Short-option tests reverse those sides. Apply an
-explicit latency policy, fees, slippage stress, stale-quote limit, and trading
-calendar before creating outcome labels. Current snapshot endpoints are not
-historical reconstruction and must not be used for old Telegram signals.
-
-`fetch_news()` applies the same bounded-window rule to timestamped ticker news.
-For a signal explanation, the news window must end at the signal's publication
-time. Post-signal articles may be used only for outcome attribution, never as
-input features for that signal.
-
-For Schwab retail accounts, `SchwabHTTPClient` normalizes the Trader API option
-chain and quote responses. Supply `SCHWAB_ACCESS_TOKEN` at runtime or pass a
-secret-managed `token_provider`; never commit OAuth tokens. The adapter is
-read-only and does not expose order endpoints.
-
 ## Data-quality rule
 
 Every source provides a value and a confidence. Missing or unverifiable data

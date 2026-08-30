@@ -116,7 +116,8 @@ f_{OI}=\tanh\left(
 \right).
 \]
 
-Otherwise the OI level is used with deliberately lower confidence.
+Without a stable previous-contract observation, static OI is retained as a
+regime diagnostic but contributes zero directional OI confidence.
 
 Structural gamma exposure is
 
@@ -330,3 +331,109 @@ Under \(\log(S_H/S_t)\sim N(\mu_H,V_H)\), the complete outputs are
 
 These are model expectations conditioned on supplied data, not guarantees or
 arbitrage-free option prices.
+
+## 11. Causal completeness, calibration, and abstention
+
+The six intraday inputs `VWAP`, `RVOL`, 5-minute return, 15-minute return,
+realized volatility, and minutes from the open are treated as observed causal
+fields. With source confidence \(c_s\), their completeness is
+
+\[
+q_{data}=c_s\frac{1}{6}\sum_{j=1}^{6}\mathbf 1\{x_j\text{ is valid}\}.
+\]
+
+For raw probability \(p=\Phi(\mu_H/\sqrt{V_H})\) and evidence quality
+\(q_e\), the conservative probability exposed by the model is
+
+\[
+p_c=\frac12+\left(p-\frac12\right)q_eq_{data},\qquad
+e_c=2\left|p_c-\frac12\right|.
+\]
+
+The model abstains when the trading day is invalid, causal completeness or
+evidence quality is below its configured floor, or \(e_c\) is too small. Raw
+probability and numerical expectations remain available for scoring. An
+invalid training day is evaluated against a disposable copy of online state,
+so it cannot update ELO ratings or factor covariance.
+
+## 12. Event-risk modifier
+
+Timestamped events modify uncertainty, never direction. Define proximity
+
+\[
+g(m;h)=\begin{cases}e^{-m/h},&m\ge0\\0,&\text{otherwise},\end{cases}
+\]
+
+with e-folding decay constants of 390 minutes for earnings and 180 minutes for
+macro events.
+For event confidence \(c\), surprise \(z\), and headline intensity \(n\),
+
+\[
+r=.75\max(g_{earn},g_{macro})+.20\min(|z|,3)/3+.15\operatorname{clip}(n,0,1),
+\]
+
+\[
+V_H^{event}=V_H(1+cr),\qquad q_e^{event}=q_e/(1+cr).
+\]
+
+## 13. Shadow contract-value approximation
+
+Contract selection is a separate diagnostic and does not feed back into the
+underlying Ocean Wave direction. Under explicitly declared quote and Greek
+units, the premium-change approximation is
+
+\[
+E[\Delta V]=\Delta S\mu_H+\frac12\Gamma S^2(V_H+\mu_H^2)
++\Theta H/390+100\mathcal V\,\Delta IV.
+\]
+
+The executable edge subtracts one round-trip spread and per-share fees:
+
+\[
+E[\Delta V]_{net}=E[\Delta V]-(Ask-Bid)-Fee/Multiplier.
+\]
+
+Missing Greeks, ambiguous units, an unmatched contract, or an unavailable
+horizon produces an explicit abstention rather than an imputed value. The
+base, IV-expansion, and IV-contraction scenarios remain shadow-only.
+
+## 14. Causal intraday Fourier features
+
+Let \(r_0,\ldots,r_{N-1}\) be only the return prefix observable at the
+forecast cut-off. The C++ kernel fits a causal OLS line \(a+bn\), applies a
+Hann taper \(w_n=(1-\cos(2\pi n/(N-1)))/2\), and evaluates
+
+\[
+A_k=\frac{2}{N\bar w}\sum_{n=0}^{N-1}w_n(r_n-a-bn)\cos(2\pi kn/N),
+\]
+
+\[
+B_k=\frac{2}{N\bar w}\sum_{n=0}^{N-1}w_n(r_n-a-bn)\sin(2\pi kn/N),
+\qquad P_k\propto A_k^2+B_k^2.
+\]
+
+Energy is summarized in fixed 2–5, 5–15, 15–60, and 60–120 minute period
+bands. The transform never pads from or centers on future observations, and
+native-core unavailability yields an abstention rather than a Python spectral
+fallback.
+
+## 15. Bounded shadow calibration
+
+For observed outcome \(y\in\{0,1\}\), a shadow bucket uses
+
+\[
+\hat p=\sigma(a+b\operatorname{logit}(p)),\qquad
+\eta_n=\eta_0/\sqrt{1+n/25},
+\]
+
+\[
+a\leftarrow\operatorname{clip}(a+\eta_n(y-\hat p),-1.5,1.5),
+\quad
+b\leftarrow\operatorname{clip}(b+\eta_n(y-\hat p)\operatorname{logit}(p),.5,1.5).
+\]
+
+Event identifiers make feedback idempotent. Invalid sessions do not mutate
+state, and the projected probability is constrained toward 0.5 so calibration
+cannot manufacture stronger conviction. The default promotion gate requires
+500 mature samples and 40 valid trading days; callers may configure a separate
+research threshold explicitly.
