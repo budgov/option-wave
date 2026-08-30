@@ -41,7 +41,7 @@ class MarketState:
     vwap: float | None = None
     rvol: float | None = None
     realized_vol: float | None = None
-    minutes_from_open: float = 0.0
+    minutes_from_open: float | None = 0.0
     minutes_to_close_total: float = 390.0
     symbol: str | None = None
     previous_close: float | None = None
@@ -50,6 +50,18 @@ class MarketState:
     stock_volume: float | None = None
     stock_dollar_volume: float | None = None
     data_confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class EventContext:
+    """Timestamped event context that modifies risk, not direction."""
+
+    minutes_to_earnings: float | None = None
+    minutes_to_macro: float | None = None
+    event_surprise_z: float | None = None
+    headline_intensity: float | None = None
+    confidence: float = 0.0
+    as_of: pd.Timestamp | str | None = None
 
 
 @dataclass
@@ -84,6 +96,9 @@ class ModelConfig:
     flow: FlowConfig = field(default_factory=FlowConfig)
     inverse: InverseConfig = field(default_factory=InverseConfig)
     forecast_horizons_minutes: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0)
+    minimum_actionable_edge: float = 0.10
+    minimum_evidence_quality: float = 0.25
+    minimum_market_data_quality: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,9 @@ class ModelResult:
     trend_score: float
     direction: str
     confidence: float
+    evidence_quality: float
+    directional_edge: float
+    confidence_semantics: str
     diagnostics: dict[str, object]
     factor_table: pd.DataFrame
     factor_covariance: np.ndarray
@@ -113,6 +131,10 @@ class ModelResult:
     distance_grid: np.ndarray
     expiry_grid: np.ndarray
     field_grid: np.ndarray
+    raw_probability: float = 0.5
+    calibrated_probability: float = 0.5
+    actionability: str = "abstain"
+    abstain_reason: str | None = "unspecified"
 
     @property
     def expected_price(self) -> float:
@@ -141,6 +163,63 @@ def _combine_indicators(values: Sequence[float], confidences: Sequence[float]) -
         float(np.clip(np.average(value_array[valid], weights=weights), -1.0, 1.0)),
         float(np.clip(weights.mean(), 0.0, 1.0)),
     )
+
+
+def _market_data_quality(state: MarketState) -> tuple[float, tuple[str, ...]]:
+    """Return causal intraday-feature completeness without inventing values."""
+
+    checks = {
+        "vwap": state.vwap is not None and np.isfinite(state.vwap) and state.vwap > 0.0,
+        "rvol": state.rvol is not None and np.isfinite(state.rvol) and state.rvol > 0.0,
+        "return_5m": state.return_5m is not None and np.isfinite(state.return_5m),
+        "return_15m": state.return_15m is not None and np.isfinite(state.return_15m),
+        "realized_vol": (
+            state.realized_vol is not None
+            and np.isfinite(state.realized_vol)
+            and state.realized_vol > 0.0
+        ),
+        "minutes_from_open": (
+            state.minutes_from_open is not None
+            and np.isfinite(state.minutes_from_open)
+            and state.minutes_from_open >= 0.0
+        ),
+    }
+    missing = tuple(name for name, present in checks.items() if not present)
+    completeness = sum(checks.values()) / len(checks)
+    source_value = state.data_confidence
+    source_confidence = (
+        float(np.clip(source_value, 0.0, 1.0))
+        if source_value is not None and np.isfinite(source_value)
+        else 0.0
+    )
+    return float(completeness * source_confidence), missing
+
+
+_PUBLIC_DECIMALS = 12
+
+
+def _canonical_float(value: float) -> float:
+    """Remove backend-only floating noise at the public result boundary."""
+
+    number = float(value)
+    return float(round(number, _PUBLIC_DECIMALS)) if np.isfinite(number) else number
+
+
+def _canonical_array(values: np.ndarray) -> np.ndarray:
+    return np.round(np.asarray(values, dtype=float), decimals=_PUBLIC_DECIMALS)
+
+
+def _canonical_expectation(value: Expectation) -> Expectation:
+    return Expectation(*(_canonical_float(item) for item in (
+        value.horizon_minutes,
+        value.integrated_signal,
+        value.average_signal,
+        value.expected_return,
+        value.expected_price,
+        value.return_variance,
+        value.price_variance,
+        value.probability_up,
+    )))
 
 
 def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -198,6 +277,64 @@ class OceanWave:
     def reset(self) -> None:
         self._ratings.clear()
         self._factor_state = FactorState.create(self.config.factors)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable online state for one underlying symbol."""
+
+        ratings = [
+            {
+                "right": str(key[0]),
+                "expiry_days": float(key[1]),
+                "distance_pct": float(key[2]),
+                "rating": float(value),
+            }
+            for key, value in sorted(self._ratings.items(), key=lambda item: item[0])
+        ]
+        return {
+            "schema_version": "ocean-wave-state.v1",
+            "ratings": ratings,
+            "factor_state": {
+                "mean": self._factor_state.mean.tolist(),
+                "covariance": self._factor_state.covariance.tolist(),
+                "count": float(self._factor_state.count),
+            },
+        }
+
+    def load_state_dict(self, payload: dict[str, object]) -> None:
+        """Restore validated online state without using executable pickle data."""
+
+        if payload.get("schema_version") != "ocean-wave-state.v1":
+            raise ValueError("unsupported Ocean Wave state schema")
+        restored_ratings: dict[tuple[str, float, float], float] = {}
+        for item in payload.get("ratings", []):
+            if not isinstance(item, dict):
+                raise ValueError("invalid rating state entry")
+            key = (
+                str(item["right"]),
+                float(item["expiry_days"]),
+                float(item["distance_pct"]),
+            )
+            value = float(item["rating"])
+            if not np.isfinite(value):
+                raise ValueError("rating state must be finite")
+            restored_ratings[key] = value
+
+        factor = payload.get("factor_state")
+        if not isinstance(factor, dict):
+            raise ValueError("missing factor state")
+        mean = np.asarray(factor.get("mean"), dtype=float)
+        covariance = np.asarray(factor.get("covariance"), dtype=float)
+        dimension = len(self.config.factors.names)
+        if mean.shape != (dimension,) or covariance.shape != (dimension, dimension):
+            raise ValueError("factor state has incompatible dimensions")
+        if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(covariance)):
+            raise ValueError("factor state must be finite")
+        count = float(factor.get("count", 0.0))
+        if not np.isfinite(count) or count < 0.0:
+            raise ValueError("factor state count is invalid")
+
+        self._ratings = restored_ratings
+        self._factor_state = FactorState(mean=mean, covariance=covariance, count=count)
 
     def _inverse_observation(
         self,
@@ -352,6 +489,34 @@ class OceanWave:
         }
         return values, confidences, details
 
+    @staticmethod
+    def _event_risk(context: EventContext | None) -> tuple[float, float, dict[str, float]]:
+        """Return variance/confidence multipliers without fabricating direction."""
+        if context is None or context.confidence <= 0.0:
+            return 1.0, 1.0, {"event_risk_multiplier": 1.0, "event_confidence_multiplier": 1.0}
+        confidence = float(np.clip(context.confidence, 0.0, 1.0))
+
+        def proximity(minutes: float | None, half_life: float) -> float:
+            if minutes is None or not np.isfinite(minutes) or minutes < 0.0:
+                return 0.0
+            return float(np.exp(-float(minutes) / half_life))
+
+        earnings = proximity(context.minutes_to_earnings, 390.0)
+        macro = proximity(context.minutes_to_macro, 180.0)
+        surprise = min(abs(float(context.event_surprise_z or 0.0)), 3.0) / 3.0
+        headlines = float(np.clip(context.headline_intensity or 0.0, 0.0, 1.0))
+        raw = 0.75 * max(earnings, macro) + 0.20 * surprise + 0.15 * headlines
+        variance_multiplier = float(1.0 + confidence * raw)
+        confidence_multiplier = float(1.0 / variance_multiplier)
+        return variance_multiplier, confidence_multiplier, {
+            "event_risk_multiplier": variance_multiplier,
+            "event_confidence_multiplier": confidence_multiplier,
+            "event_earnings_proximity": earnings,
+            "event_macro_proximity": macro,
+            "event_surprise_magnitude": surprise,
+            "event_headline_intensity": headlines,
+        }
+
     def predict(
         self,
         chain: pd.DataFrame,
@@ -366,11 +531,27 @@ class OceanWave:
         inverse_state: MarketState | None = None,
         inverse_beta: float | None = None,
         inverse_markets: Sequence[InverseMarketData] | None = None,
+        event_context: EventContext | None = None,
+        training_day_valid: bool = True,
     ) -> ModelResult:
-        """Calculate the Ocean Wave field and integrated price expectations."""
+        """Calculate the Ocean Wave field and integrated price expectations.
+
+        An invalid training day is still scored for diagnosis, but all online
+        ELO and covariance updates are applied to disposable copies.  Existing
+        callers retain the original learning behavior because the new keyword
+        defaults to ``True``.
+        """
 
         if state.spot <= 0.0:
             raise ValueError("state.spot must be positive")
+        if not isinstance(training_day_valid, bool):
+            raise TypeError("training_day_valid must be bool")
+        ratings = self._ratings if training_day_valid else dict(self._ratings)
+        factor_state = self._factor_state if training_day_valid else FactorState(
+            mean=self._factor_state.mean.copy(),
+            covariance=self._factor_state.covariance.copy(),
+            count=float(self._factor_state.count),
+        )
         chain_summary = extract_chain_factors(
             chain,
             state.spot,
@@ -378,7 +559,7 @@ class OceanWave:
             previous_chain=previous_chain,
         )
         elo_config = self.config.elo
-        surface = build_elo_surface(chain, state.spot, elo_config, self._ratings)
+        surface = build_elo_surface(chain, state.spot, elo_config, ratings)
         if HAS_CPP_CORE and hasattr(cpp_core, "aggregate_surface_signals"):
             aggregate = cpp_core.aggregate_surface_signals(
                 np.ascontiguousarray(surface["effective_score"].to_numpy(float)),
@@ -420,7 +601,8 @@ class OceanWave:
             inverse_target,
             inverse_confidence,
         )
-        blend: FactorBlend = adaptive_blend(factor_values, factor_confidences, self._factor_state, self.config.factors)
+        blend: FactorBlend = adaptive_blend(factor_values, factor_confidences, factor_state, self.config.factors)
+        event_variance_multiplier, event_confidence_multiplier, event_details = self._event_risk(event_context)
 
         horizons = tuple(sorted(set(horizons_minutes or self.config.forecast_horizons_minutes)))
         if not horizons or horizons[0] <= 0.0:
@@ -475,14 +657,17 @@ class OceanWave:
                 probabilities_up,
             ):
                 horizon, integrated, average, expected_return, expected_price, return_variance, price_variance, probability_up = values
+                adjusted_variance = float(return_variance) * event_variance_multiplier
+                expected_log_return = np.log1p(float(expected_return)) - 0.5 * float(return_variance)
+                probability_up = _normal_cdf(expected_log_return / max(sqrt(adjusted_variance), EPS))
                 expectations[float(horizon)] = Expectation(
                     float(horizon),
                     float(integrated),
                     float(average),
                     float(expected_return),
                     float(expected_price),
-                    float(return_variance),
-                    float(price_variance),
+                    adjusted_variance,
+                    float(price_variance) * event_variance_multiplier,
                     float(probability_up),
                 )
             current_field_signal = float(forecast["current_field_signal"])
@@ -507,7 +692,7 @@ class OceanWave:
                 scores[step] = _weighted_mean(field_grid.ravel(), grid_weights.ravel())
             integrated_values = []
             average_values = []
-            trapezoid = getattr(np, "trapezoid", np.trapz)
+            trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
             for horizon in horizons:
                 index = min(int(np.ceil(horizon / timestep)), steps)
                 elapsed = np.arange(index + 1, dtype=float) * timestep
@@ -530,7 +715,7 @@ class OceanWave:
                     + liquidity_risk
                     + pde_config.vrp_variance_scale * abs(chain_summary.volatility_risk_premium)
                 )
-                return_variance = volatility * volatility * max(year_fraction, 0.0) * risk_multiplier
+                return_variance = volatility * volatility * max(year_fraction, 0.0) * risk_multiplier * event_variance_multiplier
                 expected_price = state.spot * exp(expected_log_return + 0.5 * return_variance)
                 price_variance = expected_price * expected_price * np.expm1(return_variance)
                 z_score = expected_log_return / max(sqrt(return_variance), EPS)
@@ -555,7 +740,46 @@ class OceanWave:
             ))
             median_distance = float(np.median(distances))
 
+        # Native and reference kernels intentionally implement the same
+        # equations, but different instruction order can leave a few ulps of
+        # noise. Canonicalize only once, at the public output boundary.
+        expectations = {
+            _canonical_float(horizon): _canonical_expectation(value)
+            for horizon, value in expectations.items()
+        }
+        distances = _canonical_array(distances)
+        expiries = _canonical_array(expiries)
+        field_grid = _canonical_array(field_grid)
+        surface = surface.round(_PUBLIC_DECIMALS)
+        trend_score = _canonical_float(trend_score)
+        confidence = _canonical_float(
+            np.clip(confidence * event_confidence_multiplier, 0.0, 1.0)
+        )
+        current_field_signal = _canonical_float(current_field_signal)
         longest = expectations[max(expectations)]
+        evidence_quality = confidence
+        raw_probability = float(np.clip(longest.probability_up, 0.0, 1.0))
+        directional_edge = _canonical_float(np.clip(2.0 * abs(raw_probability - 0.5), 0.0, 1.0))
+        market_data_quality, missing_market_features = _market_data_quality(state)
+        calibration_strength = float(np.clip(evidence_quality * market_data_quality, 0.0, 1.0))
+        calibrated_probability = _canonical_float(0.5 + (raw_probability - 0.5) * calibration_strength)
+        calibrated_directional_edge = _canonical_float(
+            np.clip(2.0 * abs(calibrated_probability - 0.5), 0.0, 1.0)
+        )
+        abstain_reasons: list[str] = []
+        if not training_day_valid:
+            abstain_reasons.append("invalid_training_day")
+        if market_data_quality < float(np.clip(self.config.minimum_market_data_quality, 0.0, 1.0)):
+            abstain_reasons.append("insufficient_market_data")
+        if evidence_quality < float(np.clip(self.config.minimum_evidence_quality, 0.0, 1.0)):
+            abstain_reasons.append("insufficient_evidence_quality")
+        if calibrated_directional_edge < float(np.clip(self.config.minimum_actionable_edge, 0.0, 1.0)):
+            abstain_reasons.append("weak_directional_edge")
+        actionability = "abstain" if abstain_reasons else "actionable"
+        abstain_reason = abstain_reasons[0] if abstain_reasons else None
+        raw_direction = self._direction(trend_score)
+        direction = "Abstain" if abstain_reasons else raw_direction
+        confidence_semantics = "evidence_reliability_not_direction_probability"
         diagnostics: dict[str, object] = {
             **factor_details,
             "model_name": "Ocean Wave",
@@ -582,19 +806,37 @@ class OceanWave:
             "inverse_native_signal": inverse_native,
             "inverse_target_signal": inverse_target,
             "inverse_confidence": inverse_confidence,
+            **event_details,
             "inverse_count": float(len(inverse_symbols)),
             "inverse_symbols": ",".join(inverse_symbols),
             "energy_cost_at_median_distance": float(energy_cost(median_distance, elo_config)),
             "expected_return": longest.expected_return,
-            "probability_up": longest.probability_up,
+            "probability_up": raw_probability,
+            "raw_probability": raw_probability,
+            "calibrated_probability": calibrated_probability,
+            "calibration_strength": calibration_strength,
+            "evidence_quality": evidence_quality,
+            "market_data_quality": market_data_quality,
+            "missing_market_features": list(missing_market_features),
+            "directional_edge": directional_edge,
+            "calibrated_directional_edge": calibrated_directional_edge,
+            "raw_direction": raw_direction,
+            "actionability": actionability,
+            "abstain_reason": abstain_reason,
+            "abstain_reasons": list(abstain_reasons),
+            "training_day_valid": training_day_valid,
+            "confidence_semantics": confidence_semantics,
         }
         return ModelResult(
             trend_score=trend_score,
-            direction=self._direction(trend_score),
+            direction=direction,
             confidence=confidence,
+            evidence_quality=evidence_quality,
+            directional_edge=directional_edge,
+            confidence_semantics=confidence_semantics,
             diagnostics=diagnostics,
-            factor_table=blend.table,
-            factor_covariance=self._factor_state.covariance.copy(),
+            factor_table=blend.table.round(_PUBLIC_DECIMALS),
+            factor_covariance=_canonical_array(factor_state.covariance.copy()),
             chain_factors=chain_summary,
             flow_summary=flow_summary,
             expectations=expectations,
@@ -602,6 +844,10 @@ class OceanWave:
             distance_grid=distances,
             expiry_grid=expiries,
             field_grid=field_grid,
+            raw_probability=raw_probability,
+            calibrated_probability=calibrated_probability,
+            actionability=actionability,
+            abstain_reason=abstain_reason,
         )
 
     def _volatility(self, chain: pd.DataFrame, state: MarketState, summary: ChainFactorSummary) -> float:

@@ -174,16 +174,59 @@ def _oi_change(chain: pd.DataFrame, previous_chain: pd.DataFrame | None, side: s
     required = {"strike", f"{side}_oi"}
     if not required.issubset(previous_chain.columns) or "strike" not in chain:
         return explicit
-    current_expiry = _expiry(chain)
-    previous_expiry = _expiry(previous_chain)
-    previous = pd.DataFrame({
-        "strike": _numeric(previous_chain, "strike"),
-        "expiry_days": previous_expiry,
-        "oi": _numeric(previous_chain, f"{side}_oi"),
-    }).dropna(subset=["strike"])
-    previous = previous.groupby(["strike", "expiry_days"], sort=False)["oi"].last()
-    keys = pd.MultiIndex.from_arrays([_numeric(chain, "strike"), current_expiry])
-    prior = previous.reindex(keys).to_numpy(float)
+
+    # DTE is not a contract identity: it decreases every calendar day and made
+    # an unchanged contract look new at the next session. Match provider/OCC
+    # symbols first, then the stable expiry-date + strike + side tuple. The
+    # second pass also migrates checkpoints written before symbols were kept.
+    prior = np.full(len(chain), np.nan, dtype=float)
+    previous_oi = _numeric(previous_chain, f"{side}_oi")
+    current_symbol_column = f"{side}_symbol" if f"{side}_symbol" in chain else "contract_symbol"
+    previous_symbol_column = (
+        f"{side}_symbol" if f"{side}_symbol" in previous_chain else "contract_symbol"
+    )
+    if current_symbol_column in chain and previous_symbol_column in previous_chain:
+        previous_symbols = previous_chain[previous_symbol_column].astype("string").str.strip().str.upper()
+        current_symbols = chain[current_symbol_column].astype("string").str.strip().str.upper()
+        valid_previous = previous_symbols.notna() & previous_symbols.ne("") & np.isfinite(previous_oi)
+        if valid_previous.any():
+            symbol_lookup = pd.Series(
+                previous_oi[valid_previous.to_numpy()],
+                index=previous_symbols[valid_previous],
+            ).groupby(level=0, sort=False).last()
+            valid_current = current_symbols.notna() & current_symbols.ne("")
+            if valid_current.any():
+                positions = np.flatnonzero(valid_current.to_numpy())
+                prior[positions] = symbol_lookup.reindex(current_symbols.iloc[positions]).to_numpy(float)
+
+    unmatched = ~np.isfinite(prior)
+    if np.any(unmatched) and "expiry_date" in chain and "expiry_date" in previous_chain:
+        previous_strike = _numeric(previous_chain, "strike")
+        current_strike = _numeric(chain, "strike")
+        previous_expiry = pd.to_datetime(previous_chain["expiry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        current_expiry = pd.to_datetime(chain["expiry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        previous_keys = pd.MultiIndex.from_arrays([
+            previous_expiry,
+            previous_strike,
+            np.full(len(previous_chain), side, dtype=object),
+        ])
+        valid_previous = previous_expiry.notna().to_numpy() & np.isfinite(previous_strike) & np.isfinite(previous_oi)
+        if np.any(valid_previous):
+            fallback_lookup = pd.Series(
+                previous_oi[valid_previous],
+                index=previous_keys[valid_previous],
+            ).groupby(level=[0, 1, 2], sort=False).last()
+            current_keys = pd.MultiIndex.from_arrays([
+                current_expiry,
+                current_strike,
+                np.full(len(chain), side, dtype=object),
+            ])
+            positions = np.flatnonzero(
+                unmatched & current_expiry.notna().to_numpy() & np.isfinite(current_strike)
+            )
+            if positions.size:
+                prior[positions] = fallback_lookup.reindex(current_keys[positions]).to_numpy(float)
+
     current = _numeric(chain, f"{side}_oi")
     return current - prior
 
@@ -235,15 +278,21 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
     put_quality = np.where(valid_put_quote, np.exp(-4.0 * np.maximum(put_ask - put_bid, 0.0) / np.maximum(put_price, EPS)), 0.0)
     activity = 1.0 + np.log1p(call_volume + put_volume)
     liquidity = float(np.average(0.5 * (call_quality + put_quality), weights=activity)) if len(activity) else 0.0
-    change_available = np.isfinite(call_oi_change).any() or np.isfinite(put_oi_change).any()
-    if change_available:
+    change_observed = np.isfinite(call_oi_change).any() or np.isfinite(put_oi_change).any()
+    if change_observed:
         call_change = np.nan_to_num(call_oi_change) * call_delta_abs * base_weight
         put_change = np.nan_to_num(put_oi_change) * put_delta_abs * base_weight
-        oi_signal = float(np.tanh((call_change.sum() - put_change.sum()) / max(np.abs(call_change).sum() + np.abs(put_change).sum(), EPS)))
+        oi_change_gross = float(np.abs(call_change).sum() + np.abs(put_change).sum())
+        directional_oi_change = oi_change_gross > EPS
+        oi_signal = (
+            float(np.tanh((call_change.sum() - put_change.sum()) / oi_change_gross))
+            if directional_oi_change else 0.0
+        )
     else:
-        call_position = np.maximum(call_oi, 0.0) * call_delta_abs * base_weight
-        put_position = np.maximum(put_oi, 0.0) * put_delta_abs * base_weight
-        oi_signal = float(np.tanh((call_position.sum() - put_position.sum()) / max(call_position.sum() + put_position.sum(), EPS)))
+        # Static OI is useful context, but without a source update it is not a
+        # timestamped directional observation. Keep it out of online weights.
+        directional_oi_change = False
+        oi_signal = 0.0
     call_otm = (strike >= spot) & np.isfinite(call_iv) & (call_iv > 0.0)
     put_otm = (strike <= spot) & np.isfinite(put_iv) & (put_iv > 0.0)
     iv_weight = base_weight * activity
@@ -275,13 +324,21 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
     put_gex = put_oi * np.nan_to_num(np.abs(put_gamma)) * 100.0 * spot * spot * base_weight
     gross_gex = float(call_gex.sum() + put_gex.sum())
     rows = max(len(chain), 1)
+    oi_change_coverage = float(np.count_nonzero(
+        np.isfinite(call_oi_change) | np.isfinite(put_oi_change)
+    ) / rows)
     return {
         "energy_signal": energy_signal,
         "energy_confidence": float(np.clip(0.75 * np.log1p((call_volume + put_volume).sum()) / np.log(10001.0) * (0.35 + 0.65 * liquidity), 0.0, 1.0)),
         "call_energy": call_energy,
         "put_energy": put_energy,
         "oi_signal": oi_signal,
-        "oi_confidence": float(np.clip((0.55 if change_available else 0.25) * (0.4 + 0.6 * liquidity), 0.0, 1.0)),
+        "oi_confidence": float(np.clip(
+            (0.55 + 0.45 * oi_change_coverage) * (0.4 + 0.6 * liquidity)
+            if directional_oi_change else 0.0,
+            0.0,
+            1.0,
+        )),
         "iv_surface_signal": iv_signal,
         "iv_confidence": float(np.clip(np.count_nonzero(valid_iv) / rows * (0.4 + 0.6 * liquidity), 0.0, 1.0)),
         "iv_skew": iv_skew,

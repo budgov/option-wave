@@ -9,6 +9,16 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+template <typename Callable>
+void require_throws(Callable&& callable, const char* message) {
+    try {
+        callable();
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
 int main() {
     const auto aggregate = ocean_wave::aggregate_surface(
         {0.60, 0.40},
@@ -55,6 +65,12 @@ int main() {
     require(std::isfinite(forecast.expected_prices.back()), "finite expected price");
     require(forecast.probabilities_up.back() >= 0.0, "probability lower bound");
     require(forecast.probabilities_up.back() <= 1.0, "probability upper bound");
+    require_throws([] {
+        ocean_wave::aggregate_surface({0.5}, {0.8, 0.7}, {0.0}, {1.0});
+    }, "mismatched vectors must be rejected");
+    require_throws([] {
+        ocean_wave::evolve({0.0}, {1.0}, {0.0}, {0.0}, 0.01, 0.01, 0.0, 0.01, 0.1, 1.0, {});
+    }, "empty horizons must be rejected");
     std::cout << "C++ kernel smoke test passed\n";
     return 0;
 }

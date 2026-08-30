@@ -32,6 +32,7 @@ class EloConfig:
     k_factor: float = 32.0
     distance_exponent: float = 1.0
     min_distance: float = 0.0025
+    rating_distance_bucket: float = 0.0025
     variance_floor: float = 1e-4
     variance_scale: float = 0.05
     expiry_decay_days: float = 0.08
@@ -286,9 +287,11 @@ def build_elo_surface(
 
     cfg = cfg or EloConfig()
     surface = build_symmetric_pairs(chain, spot, cfg)
+    bucket = max(float(cfg.rating_distance_bucket), EPS)
+    binned_distance = np.round(surface["distance_pct"].to_numpy(float) / bucket) * bucket
     keys = list(zip(
-        surface["expiry_days"].round(8),
-        surface["distance_pct"].round(8),
+        surface["expiry_days"].round(4),
+        np.round(binned_distance, 8),
     ))
     call_rating = np.empty(len(surface), dtype=float)
     put_rating = np.empty(len(surface), dtype=float)
@@ -350,6 +353,19 @@ def build_elo_surface(
             if ratings is not None:
                 ratings[key_call] = c_rating
                 ratings[key_put] = p_rating
+
+    if ratings is not None:
+        # The symmetric grid shifts slightly whenever spot changes.  Keeping
+        # exact historical distances made the online state grow without bound
+        # while almost never reusing those entries.  Quantized current-grid
+        # keys preserve useful memory and release expired strikes/expiries.
+        active_keys = {
+            (right, float(expiry_days), float(distance))
+            for expiry_days, distance in keys
+            for right in ("call", "put")
+        }
+        for stale_key in set(ratings).difference(active_keys):
+            del ratings[stale_key]
 
     surface["expected_call_score"] = expected
     surface["elo_delta"] = delta_rating

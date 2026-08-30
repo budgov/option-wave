@@ -3,7 +3,9 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -15,15 +17,38 @@
 
 namespace py = pybind11;
 using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
+using Index = py::ssize_t;
 constexpr double EPS = 1e-12;
+constexpr Index MAX_ARRAY_ELEMENTS = 10'000'000;
+constexpr Index MAX_GRID_ELEMENTS = 1'000'000;
+
+void validate_arrays(Index expected, std::initializer_list<const DoubleArray*> arrays) {
+    if (expected < 0 || expected > static_cast<Index>(INT_MAX) || expected > MAX_ARRAY_ELEMENTS) {
+        throw std::runtime_error("array length exceeds the supported range");
+    }
+    for (const DoubleArray* array : arrays) {
+        if (array == nullptr || array->ndim() != 1 || array->size() != expected) {
+            throw std::runtime_error("input arrays must be one-dimensional and have compatible lengths");
+        }
+    }
+}
+
+Index checked_product(Index left, Index right) {
+    if (left <= 0 || right <= 0 || left > static_cast<Index>(INT_MAX) / right
+        || left * right > MAX_GRID_ELEMENTS) {
+        throw std::runtime_error("array grid dimensions are invalid or too large");
+    }
+    return left * right;
+}
 
 double clamp_value(double value, double low, double high) {
     return std::max(low, std::min(high, value));
 }
 
 bool solve_linear_system(std::vector<double> matrix, std::vector<double> rhs, int dimension, std::vector<double>& solution) {
-    if (dimension <= 0 || static_cast<int>(matrix.size()) != dimension * dimension
-        || static_cast<int>(rhs.size()) != dimension) {
+    const std::size_t width = dimension > 0 ? static_cast<std::size_t>(dimension) : 0;
+    if (dimension <= 0 || width > std::numeric_limits<std::size_t>::max() / width
+        || matrix.size() != width * width || rhs.size() != width) {
         return false;
     }
     for (int pivot = 0; pivot < dimension; ++pivot) {
@@ -89,9 +114,10 @@ py::array_t<double> to_array(const std::vector<T>& values) {
 }
 
 std::vector<double> to_vector(const DoubleArray& values) {
+    validate_arrays(values.size(), {&values});
     const auto view = values.unchecked<1>();
     std::vector<double> result(values.size());
-    for (ssize_t i = 0; i < values.size(); ++i) result[static_cast<std::size_t>(i)] = view(i);
+    for (Index i = 0; i < values.size(); ++i) result[static_cast<std::size_t>(i)] = view(i);
     return result;
 }
 
@@ -220,6 +246,13 @@ py::dict build_pairs(
     double variance_scale,
     double expiry_decay_days
 ) {
+    validate_arrays(strikes.size(), {
+        &strikes, &expiries, &call_price, &put_price, &call_variance, &put_variance,
+        &call_volume, &put_volume, &call_oi, &put_oi, &call_delta, &put_delta
+    });
+    if (strikes.size() < 2 || !std::isfinite(spot) || spot <= 0.0) {
+        throw std::runtime_error("chain arrays are empty or spot is invalid");
+    }
     const auto strike_view = strikes.unchecked<1>();
     const auto expiry_view = expiries.unchecked<1>();
     const auto call_price_view = call_price.unchecked<1>();
@@ -234,7 +267,12 @@ py::dict build_pairs(
     const auto put_delta_view = put_delta.unchecked<1>();
 
     std::map<double, std::vector<int>> groups;
-    for (ssize_t i = 0; i < strikes.size(); ++i) groups[expiry_view(i)].push_back(static_cast<int>(i));
+    for (Index i = 0; i < strikes.size(); ++i) {
+        if (!std::isfinite(strike_view(i)) || !std::isfinite(expiry_view(i))) {
+            throw std::runtime_error("strike and expiry arrays must contain finite values");
+        }
+        groups[expiry_view(i)].push_back(static_cast<int>(i));
+    }
     std::vector<PairRow> rows;
 
     for (auto& group_entry : groups) {
@@ -336,6 +374,9 @@ py::dict update_elo(
     double rating_scale,
     double k_factor
 ) {
+    validate_arrays(call_force.size(), {
+        &call_force, &put_force, &effective_score, &confidence, &prior_call, &prior_put
+    });
     const auto cf = call_force.unchecked<1>();
     const auto pf = put_force.unchecked<1>();
     const auto actual = effective_score.unchecked<1>();
@@ -343,7 +384,7 @@ py::dict update_elo(
     const auto old_call = prior_call.unchecked<1>();
     const auto old_put = prior_put.unchecked<1>();
     std::vector<double> call_rating(call_force.size()), put_rating(call_force.size()), expected(call_force.size()), delta(call_force.size());
-    for (ssize_t i = 0; i < call_force.size(); ++i) {
+    for (Index i = 0; i < call_force.size(); ++i) {
         const double force_ratio = std::max(cf(i), EPS) / std::max(pf(i), EPS);
         const double confidence_value = conf(i);
         double c_rating;
@@ -382,12 +423,7 @@ py::dict aggregate_flow(
     const DoubleArray& large_mask,
     double half_life_minutes
 ) {
-    if (notional.size() != direction.size()
-        || notional.size() != confidence.size()
-        || notional.size() != age_minutes.size()
-        || notional.size() != large_mask.size()) {
-        throw std::runtime_error("flow arrays have incompatible lengths");
-    }
+    validate_arrays(notional.size(), {&notional, &direction, &confidence, &age_minutes, &large_mask});
     const auto notional_view = notional.unchecked<1>();
     const auto direction_view = direction.unchecked<1>();
     const auto confidence_view = confidence.unchecked<1>();
@@ -405,7 +441,7 @@ py::dict aggregate_flow(
     double prior_net = 0.0;
     double prior_gross = 0.0;
     double large_count = 0.0;
-    for (ssize_t i = 0; i < notional.size(); ++i) {
+    for (Index i = 0; i < notional.size(); ++i) {
         const double amount = std::max(notional_view(i), 0.0);
         const double signed_direction = std::max(-1.0, std::min(1.0, direction_view(i)));
         const double conf = std::max(0.0, std::min(1.0, confidence_view(i)));
@@ -459,11 +495,10 @@ py::dict aggregate_flow_risk(
     double spot,
     double half_life_minutes
 ) {
-    const ssize_t size = notional.size();
-    if (direction.size() != size || confidence.size() != size || age_minutes.size() != size
-        || large_mask.size() != size || contracts.size() != size || delta.size() != size || gamma.size() != size) {
-        throw std::runtime_error("flow risk arrays have incompatible lengths");
-    }
+    const Index size = notional.size();
+    validate_arrays(size, {
+        &notional, &direction, &confidence, &age_minutes, &large_mask, &contracts, &delta, &gamma
+    });
     py::dict result = aggregate_flow(notional, direction, confidence, age_minutes, large_mask, half_life_minutes);
     const auto direction_view = direction.unchecked<1>();
     const auto confidence_view = confidence.unchecked<1>();
@@ -478,7 +513,7 @@ py::dict aggregate_flow_risk(
     double gamma_net = 0.0;
     double gamma_gross = 0.0;
     double greek_coverage = 0.0;
-    for (ssize_t i = 0; i < size; ++i) {
+    for (Index i = 0; i < size; ++i) {
         const double contracts_value = std::max(contracts_view(i), 0.0);
         const double signed_direction = clamp_value(direction_view(i), -1.0, 1.0);
         const double conf = clamp_value(confidence_view(i), 0.0, 1.0);
@@ -533,14 +568,13 @@ py::dict extract_chain_factors(
     double spot,
     double realized_vol
 ) {
-    const ssize_t size = strikes.size();
-    const std::vector<ssize_t> sizes = {
-        expiries.size(), call_price.size(), put_price.size(), call_bid.size(), call_ask.size(),
-        put_bid.size(), put_ask.size(), call_volume.size(), put_volume.size(), call_oi.size(),
-        put_oi.size(), call_oi_change.size(), put_oi_change.size(), call_iv.size(), put_iv.size(),
-        call_delta.size(), put_delta.size(), call_gamma.size(), put_gamma.size(), call_vega.size(), put_vega.size()
-    };
-    if (spot <= 0.0 || std::any_of(sizes.begin(), sizes.end(), [&](ssize_t value) { return value != size; })) {
+    const Index size = strikes.size();
+    validate_arrays(size, {
+        &strikes, &expiries, &call_price, &put_price, &call_bid, &call_ask, &put_bid, &put_ask,
+        &call_volume, &put_volume, &call_oi, &put_oi, &call_oi_change, &put_oi_change,
+        &call_iv, &put_iv, &call_delta, &put_delta, &call_gamma, &put_gamma, &call_vega, &put_vega
+    });
+    if (!std::isfinite(spot) || spot <= 0.0) {
         throw std::runtime_error("chain factor arrays have incompatible lengths or non-positive spot");
     }
 
@@ -569,8 +603,6 @@ py::dict extract_chain_factors(
 
     double call_energy = 0.0;
     double put_energy = 0.0;
-    double call_oi_mass = 0.0;
-    double put_oi_mass = 0.0;
     double oi_change_net = 0.0;
     double oi_change_gross = 0.0;
     double net_gex = 0.0;
@@ -613,7 +645,7 @@ py::dict extract_chain_factors(
         }
     };
 
-    for (ssize_t i = 0; i < size; ++i) {
+    for (Index i = 0; i < size; ++i) {
         if (!std::isfinite(strike(i)) || strike(i) <= 0.0) continue;
         const double log_moneyness = std::log(strike(i) / spot);
         const double d = std::abs(log_moneyness);
@@ -633,8 +665,6 @@ py::dict extract_chain_factors(
         const double put_delta_value = std::isfinite(pd(i)) ? std::abs(pd(i)) : 0.5;
         call_energy += call_price_value * call_volume_value * 100.0 * call_delta_value * base_weight;
         put_energy += put_price_value * put_volume_value * 100.0 * put_delta_value * base_weight;
-        call_oi_mass += call_oi_value * call_delta_value * base_weight;
-        put_oi_mass += put_oi_value * put_delta_value * base_weight;
         if (std::isfinite(coic(i)) || std::isfinite(poic(i))) {
             const double call_change = std::isfinite(coic(i)) ? coic(i) * call_delta_value * base_weight : 0.0;
             const double put_change = std::isfinite(poic(i)) ? poic(i) * put_delta_value * base_weight : 0.0;
@@ -692,9 +722,10 @@ py::dict extract_chain_factors(
     const double energy_gross = call_energy + put_energy;
     const double energy_signal = std::tanh((call_energy - put_energy) / std::max(energy_gross, EPS));
     const bool has_oi_change = oi_change_coverage > 0.0;
-    const double oi_signal = has_oi_change
+    const bool directional_oi_change = has_oi_change && oi_change_gross > EPS;
+    const double oi_signal = directional_oi_change
         ? std::tanh(oi_change_net / std::max(oi_change_gross, EPS))
-        : std::tanh((call_oi_mass - put_oi_mass) / std::max(call_oi_mass + put_oi_mass, EPS));
+        : 0.0;
     const double call_otm_iv = call_otm_iv_sum / std::max(call_otm_iv_weight, EPS);
     const double put_otm_iv = put_otm_iv_sum / std::max(put_otm_iv_weight, EPS);
     const bool has_two_sided_iv = call_otm_iv_weight > EPS && put_otm_iv_weight > EPS;
@@ -707,7 +738,9 @@ py::dict extract_chain_factors(
     const double vrp = (std::isfinite(realized_vol) && realized_vol > 0.0 && atm_iv_weight > EPS) ? atm_iv - realized_vol : 0.0;
     const double liquidity_quality = quote_quality_weight > EPS ? clamp_value(quote_quality_sum / quote_quality_weight, 0.0, 1.0) : 0.0;
     const double row_count = std::max(static_cast<double>(size), 1.0);
-    const double activity_confidence = clamp_value(std::log1p(total_volume) / std::log(10001.0), 0.0, 1.0);
+    // Keep the Python reference ordering: the final confidence is clipped,
+    // not the activity term before it is multiplied by quote quality.
+    const double activity_confidence = std::log1p(total_volume) / std::log(10001.0);
 
     py::dict result;
     result["energy_signal"] = energy_signal;
@@ -715,7 +748,13 @@ py::dict extract_chain_factors(
     result["call_energy"] = call_energy;
     result["put_energy"] = put_energy;
     result["oi_signal"] = oi_signal;
-    result["oi_confidence"] = clamp_value((has_oi_change ? 0.55 + 0.45 * oi_change_coverage / row_count : 0.25) * (0.4 + 0.6 * liquidity_quality), 0.0, 1.0);
+    result["oi_confidence"] = clamp_value(
+        directional_oi_change
+            ? (0.55 + 0.45 * oi_change_coverage / row_count) * (0.4 + 0.6 * liquidity_quality)
+            : 0.0,
+        0.0,
+        1.0
+    );
     result["iv_surface_signal"] = iv_signal;
     result["iv_confidence"] = clamp_value((iv_coverage / row_count) * (0.4 + 0.6 * liquidity_quality), 0.0, 1.0);
     result["iv_skew"] = iv_skew;
@@ -786,9 +825,10 @@ py::dict blend_factors(
     double ewma_alpha,
     double ridge
 ) {
-    const ssize_t dimension = factors.size();
-    if (confidences.size() != dimension || priors.size() != dimension || previous_mean.size() != dimension
-        || previous_covariance.size() != dimension * dimension || dimension <= 0) {
+    const Index dimension = factors.size();
+    validate_arrays(dimension, {&factors, &confidences, &priors, &previous_mean});
+    const Index covariance_size = checked_product(dimension, dimension);
+    if (previous_covariance.ndim() != 1 || previous_covariance.size() != covariance_size) {
         throw std::runtime_error("factor arrays have incompatible shapes");
     }
     const auto factor_view = factors.unchecked<1>();
@@ -797,26 +837,26 @@ py::dict blend_factors(
     const auto mean_view = previous_mean.unchecked<1>();
     const auto covariance_view = previous_covariance.unchecked<1>();
     const double alpha = clamp_value(ewma_alpha, 1e-4, 1.0);
-    std::vector<double> clean_factors(dimension), clean_confidence(dimension), mean(dimension), covariance(dimension * dimension);
-    for (ssize_t i = 0; i < dimension; ++i) {
+    std::vector<double> clean_factors(dimension), clean_confidence(dimension), mean(dimension), covariance(covariance_size);
+    for (Index i = 0; i < dimension; ++i) {
         clean_confidence[i] = std::isfinite(confidence_view(i)) ? clamp_value(confidence_view(i), 0.0, 1.0) : 0.0;
         clean_factors[i] = std::isfinite(factor_view(i)) ? clamp_value(factor_view(i), -1.0, 1.0) : mean_view(i);
         mean[i] = std::isfinite(mean_view(i)) ? mean_view(i) : 0.0;
     }
-    for (ssize_t i = 0; i < dimension * dimension; ++i) {
+    for (Index i = 0; i < covariance_size; ++i) {
         covariance[i] = std::isfinite(covariance_view(i)) ? covariance_view(i) : 0.0;
     }
     if (observation_count <= 0.0) {
-        for (ssize_t i = 0; i < dimension; ++i) {
+        for (Index i = 0; i < dimension; ++i) {
             if (clean_confidence[i] > 0.0) mean[i] = clean_factors[i];
         }
     } else {
         std::vector<double> old_mean = mean;
-        for (ssize_t i = 0; i < dimension; ++i) {
+        for (Index i = 0; i < dimension; ++i) {
             if (clean_confidence[i] > 0.0) mean[i] = (1.0 - alpha) * mean[i] + alpha * clean_factors[i];
         }
-        for (ssize_t row = 0; row < dimension; ++row) {
-            for (ssize_t col = 0; col < dimension; ++col) {
+        for (Index row = 0; row < dimension; ++row) {
+            for (Index col = 0; col < dimension; ++col) {
                 const double innovation_row = clean_confidence[row] > 0.0 ? clean_factors[row] - old_mean[row] : 0.0;
                 const double innovation_col = clean_confidence[col] > 0.0 ? clean_factors[col] - mean[col] : 0.0;
                 covariance[row * dimension + col] = (1.0 - alpha) * covariance[row * dimension + col]
@@ -827,14 +867,14 @@ py::dict blend_factors(
 
     std::vector<double> system = covariance;
     std::vector<double> rhs(dimension, 0.0);
-    for (ssize_t i = 0; i < dimension; ++i) {
+    for (Index i = 0; i < dimension; ++i) {
         system[i * dimension + i] += std::max(ridge, 1e-8);
         rhs[i] = std::max(std::isfinite(prior_view(i)) ? prior_view(i) : 0.0, 0.0) * clean_confidence[i];
     }
     std::vector<double> weights;
     if (!solve_linear_system(system, rhs, static_cast<int>(dimension), weights)) weights = rhs;
     double weight_sum = 0.0;
-    for (ssize_t i = 0; i < dimension; ++i) {
+    for (Index i = 0; i < dimension; ++i) {
         weights[i] = std::isfinite(weights[i]) ? std::max(weights[i], 0.0) : 0.0;
         weight_sum += weights[i];
     }
@@ -850,10 +890,10 @@ py::dict blend_factors(
     double signal = 0.0;
     double confidence_value = 0.0;
     double projected_variance = 0.0;
-    for (ssize_t i = 0; i < dimension; ++i) {
+    for (Index i = 0; i < dimension; ++i) {
         signal += weights[i] * clean_factors[i];
         confidence_value += weights[i] * clean_confidence[i];
-        for (ssize_t j = 0; j < dimension; ++j) {
+        for (Index j = 0; j < dimension; ++j) {
             projected_variance += weights[i] * covariance[i * dimension + j] * weights[j];
         }
     }
@@ -866,70 +906,6 @@ py::dict blend_factors(
     result["projected_variance"] = std::max(projected_variance, 0.0);
     result["count"] = observation_count + 1.0;
     return result;
-}
-
-double weighted_mean(const std::vector<double>& values, const std::vector<double>& weights) {
-    double numerator = 0.0;
-    double denominator = 0.0;
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        const double weight = std::max(weights[i], EPS);
-        numerator += values[i] * weight;
-        denominator += weight;
-    }
-    return denominator > EPS ? numerator / denominator : 0.0;
-}
-
-void gradient_axis(const std::vector<double>& field, int rows, int cols, const std::vector<double>& coordinates, int axis, std::vector<double>& output) {
-    output.assign(field.size(), 0.0);
-    if ((axis == 0 && rows < 2) || (axis == 1 && cols < 2)) return;
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            const int index = row * cols + col;
-            if (axis == 1) {
-                if (col == 0) {
-                    const double span = coordinates[1] - coordinates[0];
-                    output[index] = span > EPS ? (field[row * cols + 1] - field[index]) / span : 0.0;
-                } else if (col == cols - 1) {
-                    const double span = coordinates[cols - 1] - coordinates[cols - 2];
-                    output[index] = span > EPS ? (field[index] - field[row * cols + cols - 2]) / span : 0.0;
-                } else {
-                    const double left_span = coordinates[col] - coordinates[col - 1];
-                    const double right_span = coordinates[col + 1] - coordinates[col];
-                    const double denominator = left_span * right_span * (left_span + right_span);
-                    output[index] = denominator > EPS
-                        ? (-right_span * right_span * field[row * cols + col - 1]
-                           + (right_span * right_span - left_span * left_span) * field[index]
-                           + left_span * left_span * field[row * cols + col + 1]) / denominator
-                        : 0.0;
-                }
-            } else {
-                if (row == 0) {
-                    const double span = coordinates[1] - coordinates[0];
-                    output[index] = span > EPS ? (field[cols + col] - field[index]) / span : 0.0;
-                } else if (row == rows - 1) {
-                    const double span = coordinates[rows - 1] - coordinates[rows - 2];
-                    output[index] = span > EPS ? (field[index] - field[(rows - 2) * cols + col]) / span : 0.0;
-                } else {
-                    const double top_span = coordinates[row] - coordinates[row - 1];
-                    const double bottom_span = coordinates[row + 1] - coordinates[row];
-                    const double denominator = top_span * bottom_span * (top_span + bottom_span);
-                    output[index] = denominator > EPS
-                        ? (-bottom_span * bottom_span * field[(row - 1) * cols + col]
-                           + (bottom_span * bottom_span - top_span * top_span) * field[index]
-                           + top_span * top_span * field[(row + 1) * cols + col]) / denominator
-                        : 0.0;
-                }
-            }
-        }
-    }
-}
-
-std::vector<double> laplacian_axis(const std::vector<double>& field, int rows, int cols, const std::vector<double>& coordinates, int axis) {
-    std::vector<double> gradient;
-    std::vector<double> laplacian;
-    gradient_axis(field, rows, cols, coordinates, axis, gradient);
-    gradient_axis(gradient, rows, cols, coordinates, axis, laplacian);
-    return laplacian;
 }
 
 py::dict evolve_field(
@@ -945,58 +921,38 @@ py::dict evolve_field(
     double timestep_minutes,
     const std::vector<double>& horizons
 ) {
-    const auto observed_view = observed_array.unchecked<1>();
-    const auto weights_view = weights_array.unchecked<1>();
-    const auto distance_view = distances_array.unchecked<1>();
-    const auto expiry_view = expiries_array.unchecked<1>();
-    const int rows = static_cast<int>(expiries_array.size());
-    const int cols = static_cast<int>(distances_array.size());
-    const int size = rows * cols;
-    if (observed_array.size() != size || weights_array.size() != size) throw std::runtime_error("field arrays have incompatible shapes");
-    const double dt = std::max(timestep_minutes, 1e-6);
-    const double max_horizon = *std::max_element(horizons.begin(), horizons.end());
-    const int steps = static_cast<int>(std::ceil(max_horizon / dt));
-    std::vector<double> distances(cols), expiries(rows), observed(size), weights(size), field(size), next(size), scores(steps + 1);
-    for (int i = 0; i < cols; ++i) distances[i] = distance_view(i);
-    for (int i = 0; i < rows; ++i) expiries[i] = expiry_view(i);
-    for (int i = 0; i < size; ++i) {
-        observed[i] = observed_view(i);
-        weights[i] = weights_view(i);
-        field[i] = observed[i];
-    }
-    scores[0] = weighted_mean(field, weights);
-    for (int step = 1; step <= steps; ++step) {
-        const std::vector<double> lap_distance = laplacian_axis(field, rows, cols, distances, 1);
-        const std::vector<double> lap_expiry = laplacian_axis(field, rows, cols, expiries, 0);
-        std::vector<double> gradient_distance;
-        gradient_axis(field, rows, cols, distances, 1, gradient_distance);
-        for (int i = 0; i < size; ++i) {
-            const double derivative = -distance_drift * gradient_distance[i]
-                + distance_diffusion * lap_distance[i]
-                + expiry_diffusion * lap_expiry[i]
-                - decay * field[i]
-                + source_strength * (observed[i] - field[i]);
-            next[i] = std::max(-1.0, std::min(1.0, field[i] + dt * derivative));
-        }
-        field.swap(next);
-        scores[step] = weighted_mean(field, weights);
-    }
-    std::vector<double> integrals, averages;
-    integrals.reserve(horizons.size());
-    averages.reserve(horizons.size());
-    for (const double horizon : horizons) {
-        const int index = std::min(steps, static_cast<int>(std::ceil(horizon / dt)));
-        double integral = 0.0;
-        for (int i = 1; i <= index; ++i) integral += 0.5 * (scores[i] + scores[i - 1]) * dt;
-        const double elapsed = std::max(index * dt, EPS);
-        integrals.push_back(integral);
-        averages.push_back(integral / elapsed);
-    }
+    validate_arrays(observed_array.size(), {&observed_array, &weights_array});
+    validate_arrays(distances_array.size(), {&distances_array});
+    validate_arrays(expiries_array.size(), {&expiries_array});
+    const Index checked_size = checked_product(expiries_array.size(), distances_array.size());
+    if (observed_array.size() != checked_size) throw std::runtime_error("field arrays have incompatible shapes");
+    const ocean_wave::Evolution evolution = ocean_wave::evolve(
+        to_vector(observed_array),
+        to_vector(weights_array),
+        to_vector(distances_array),
+        to_vector(expiries_array),
+        distance_diffusion,
+        expiry_diffusion,
+        distance_drift,
+        decay,
+        source_strength,
+        timestep_minutes,
+        horizons,
+        true
+    );
     py::dict result;
-    result["field"] = to_array(field);
-    result["scores"] = to_array(scores);
-    result["integrals"] = to_array(integrals);
-    result["averages"] = to_array(averages);
+    result["field"] = to_array(evolution.field);
+    result["scores"] = to_array(evolution.scores);
+    result["integrals"] = to_array(evolution.integrals);
+    result["averages"] = to_array(evolution.averages);
+    return result;
+}
+
+template <typename T, std::size_t Size>
+py::array_t<double> to_array(const std::array<T, Size>& values) {
+    py::array_t<double> result(Size);
+    auto output = result.mutable_unchecked<1>();
+    for (std::size_t i = 0; i < Size; ++i) output(static_cast<Index>(i)) = static_cast<double>(values[i]);
     return result;
 }
 
@@ -1104,8 +1060,108 @@ py::dict forecast_surface(
     return result;
 }
 
+py::dict extract_intraday_fourier_features(
+    const py::array& returns_array,
+    Index valid_length,
+    Index max_harmonics,
+    double sample_interval,
+    bool linear_detrend,
+    bool hann_taper
+) {
+    if (returns_array.ndim() != 1 || !returns_array.dtype().is(py::dtype::of<double>())
+        || (returns_array.flags() & py::array::c_style) == 0) {
+        throw std::runtime_error("intraday Fourier returns must be a one-dimensional C-contiguous float64 array");
+    }
+    if (returns_array.size() < 0
+        || returns_array.size() > static_cast<Index>(ocean_wave::FOURIER_MAX_SAMPLES)
+        || valid_length < static_cast<Index>(ocean_wave::FOURIER_MIN_SAMPLES)
+        || valid_length > returns_array.size() || max_harmonics <= 0
+        || max_harmonics > static_cast<Index>(ocean_wave::FOURIER_MAX_HARMONICS)) {
+        throw std::runtime_error("intraday Fourier dimensions exceed the fixed safety bounds");
+    }
+
+    const auto typed_array = py::reinterpret_borrow<py::array_t<double>>(returns_array);
+    const auto view = typed_array.unchecked<1>();
+    std::vector<double> causal_returns(static_cast<std::size_t>(valid_length));
+    for (Index index = 0; index < valid_length; ++index) {
+        causal_returns[static_cast<std::size_t>(index)] = view(index);
+    }
+
+    ocean_wave::IntradayFourierFeatures features;
+    {
+        py::gil_scoped_release release;
+        features = ocean_wave::extract_intraday_fourier(
+            causal_returns,
+            static_cast<std::size_t>(valid_length),
+            static_cast<std::size_t>(max_harmonics),
+            sample_interval,
+            linear_detrend,
+            hann_taper
+        );
+    }
+
+    py::dict result;
+    result["schema_version"] = "intraday_fourier.v2";
+    result["feature_version"] = 2;
+    result["causal_prefix"] = true;
+    result["lookahead_samples"] = 0;
+    result["window_alignment"] = "causal_prefix_ending_at_valid_length_minus_one";
+    result["detrend_fit_interval"] = "causal_prefix_only";
+    result["input_semantics"] = "equally_spaced_returns_causal_prefix";
+    result["period_unit"] = "minutes";
+    result["phase_convention"] = "x[n]=amplitude*cos(angle+phase)";
+    result["amplitude_normalization"] = features.hann_taper ? "hann_coherent_gain" : "none";
+    result["power_normalization"] = features.hann_taper ? "hann_mean_square_gain" : "none";
+    result["detrend_strategy"] = features.linear_detrend ? "causal_ols_linear" : "causal_mean_only";
+    result["taper_strategy"] = features.hann_taper ? "causal_prefix_hann" : "none";
+    result["band_strategy"] = "fixed_period_minutes_v1";
+    result["sample_count"] = features.sample_count;
+    result["harmonic_count"] = features.harmonic_count;
+    result["sample_interval"] = features.sample_interval;
+    result["mean"] = features.mean;
+    result["input_variance"] = features.input_variance;
+    result["variance"] = features.variance;
+    result["linear_detrend"] = features.linear_detrend;
+    result["hann_taper"] = features.hann_taper;
+    result["linear_trend_intercept"] = features.linear_trend_intercept;
+    result["linear_trend_slope_per_sample"] = features.linear_trend_slope_per_sample;
+    result["linear_trend_slope_per_minute"] = features.linear_trend_slope_per_sample / features.sample_interval;
+    result["taper_coherent_gain"] = features.taper_coherent_gain;
+    result["taper_power_gain"] = features.taper_power_gain;
+    result["harmonics"] = to_array(features.harmonics);
+    result["frequencies"] = to_array(features.frequencies);
+    result["periods"] = to_array(features.periods);
+    result["cosine_coefficients"] = to_array(features.cosine_coefficients);
+    result["sine_coefficients"] = to_array(features.sine_coefficients);
+    result["amplitudes"] = to_array(features.amplitudes);
+    result["phases"] = to_array(features.phases);
+    result["power"] = to_array(features.power);
+    result["retained_energy"] = features.retained_energy;
+    result["explained_energy_fraction"] = features.explained_energy_fraction;
+    result["spectral_entropy"] = features.spectral_entropy;
+    result["dominant_harmonic"] = features.dominant_harmonic;
+    result["dominant_period"] = features.dominant_period;
+    result["dominant_phase"] = features.dominant_phase;
+    result["dominant_phase_sine"] = features.dominant_phase_sine;
+    result["dominant_phase_cosine"] = features.dominant_phase_cosine;
+    result["band_names"] = py::make_tuple("2_to_5m", "5_to_15m", "15_to_60m", "60_to_120m");
+    result["band_period_lower_minutes"] = to_array(std::array<double, 4>{2.0, 5.0, 15.0, 60.0});
+    result["band_period_upper_minutes"] = to_array(std::array<double, 4>{5.0, 15.0, 60.0, 120.0});
+    result["band_upper_inclusive"] = py::make_tuple(false, false, false, true);
+    result["band_energy"] = to_array(features.band_energy);
+    result["band_energy_fraction"] = to_array(features.band_energy_fraction);
+    result["out_of_band_energy"] = features.out_of_band_energy;
+    result["out_of_band_energy_fraction"] = features.out_of_band_energy_fraction;
+    result["band_covered_energy_fraction"] = features.band_covered_energy_fraction;
+    return result;
+}
+
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ numerical core for the Ocean Wave model";
+    module.attr("FOURIER_MIN_SAMPLES") = ocean_wave::FOURIER_MIN_SAMPLES;
+    module.attr("FOURIER_MAX_SAMPLES") = ocean_wave::FOURIER_MAX_SAMPLES;
+    module.attr("FOURIER_MAX_HARMONICS") = ocean_wave::FOURIER_MAX_HARMONICS;
+    module.attr("FOURIER_BAND_COUNT") = ocean_wave::FOURIER_BAND_COUNT;
     module.def("build_pairs", &build_pairs);
     module.def("update_elo", &update_elo);
     module.def("aggregate_flow", &aggregate_flow);
@@ -1117,4 +1173,22 @@ PYBIND11_MODULE(_core, module) {
     module.def("aggregate_surface_signals", &aggregate_surface_signals);
     module.def("compute_stock_confirmation", &compute_stock_confirmation);
     module.def("forecast_surface", &forecast_surface);
+    module.def(
+        "extract_intraday_fourier",
+        &extract_intraday_fourier_features,
+        py::arg("returns").noconvert(),
+        py::arg("valid_length").noconvert(),
+        py::arg("max_harmonics").noconvert() = 64,
+        py::arg("sample_interval") = 1.0,
+        py::arg("linear_detrend").noconvert() = true,
+        py::arg("hann_taper").noconvert() = true,
+        R"doc(
+Extract bounded Fourier features from the causal prefix of equally spaced returns.
+
+Only ``returns[:valid_length]`` is observed. The explicit cut-off prevents a
+preallocated buffer from leaking future observations. Periods and the fixed
+2-5, 5-15, 15-60 and 60-120 bands use minutes. Causal OLS detrending and a Hann
+taper are enabled by default and may be disabled explicitly for parity studies.
+)doc"
+    );
 }

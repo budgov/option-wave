@@ -1,0 +1,37 @@
+{
+  "name": "openclaw-ocean-wave-telegram",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Telegram signal research pipeline using OpenClaw Luna, Terra, and Sol agents.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "check": "node scripts/check-javascript.js && node --test",
+    "init": "node src/cli.js init",
+    "telegram:login": "node src/cli.js telegram-login",
+    "auth:sync": "node scripts/sync-openclaw-codex-auth.js",
+    "notifier:setup": "node src/cli.js notifier-setup",
+    "notifier:test": "node src/cli.js notifier-test",
+    "listen": "node src/cli.js listen",
+    "supervisor": "node scripts/ocean-wave-supervisor.js",
+    "supervisor:status": "node scripts/ocean-wave-supervisor.js --status",
+    "supervisor:stop": "node scripts/ocean-wave-supervisor.js --request-stop --timeout-seconds 3600",
+    "intraday": "node scripts/intraday-session.js",
+    "stop": "node src/cli.js stop",
+    "daily": "node src/cli.js daily",
+    "lifecycle:audit": "node src/cli.js lifecycle-audit",
+    "position:resolve": "node src/cli.js position-resolve",
+    "backtest:audit": "node scripts/backtest-audit.js",
+    "maintenance:clean": "node scripts/maintenance-clean.js",
+    "database:compact": "node scripts/database-compact.js",
+    "doctor": "node src/cli.js doctor",
+    "smoke:openclaw": "node scripts/smoke-openclaw.js",
+    "smoke:pipeline": "node scripts/smoke-pipeline.js"
+  },
+  "dependencies": {
+    "sharp": "0.35.3",
+    "teleproto": "1.228.5"
+  }
+}

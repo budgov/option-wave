@@ -12,6 +12,7 @@ from .factors import (
 )
 from .inverse import InverseLink, InverseMarketData, InverseRegistry
 from .model import (
+    EventContext,
     Expectation,
     InverseConfig,
     MarketState,
@@ -21,6 +22,8 @@ from .model import (
     PDEConfig,
 )
 from .http_api import HTTPAPIConfig, HTTPAPIError, MarketBundle, MassiveHTTPClient
+from .schwab_api import SchwabHTTPClient, SchwabHTTPConfig
+from .contract import ContractAssessment, assess_contract
 
 __all__ = [
     "EloConfig",
@@ -35,6 +38,7 @@ __all__ = [
     "PDEConfig",
     "ModelConfig",
     "MarketState",
+    "EventContext",
     "Expectation",
     "OptionWaveV09",
     "OceanWave",
@@ -47,7 +51,11 @@ __all__ = [
     "HTTPAPIError",
     "MarketBundle",
     "MassiveHTTPClient",
+    "SchwabHTTPClient",
+    "SchwabHTTPConfig",
     "InverseLink",
     "InverseMarketData",
     "InverseRegistry",
+    "ContractAssessment",
+    "assess_contract",
 ]
