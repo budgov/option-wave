@@ -46,7 +46,9 @@ class ShadowCalibrator:
         minimum_promotion_samples: int = 500,
         minimum_valid_days: int = 40,
     ) -> None:
-        self.path = Path(state_dir).resolve() / "shadow-calibration.v1.json"
+        # v1 mixed underlying direction and option P&L labels. Keep that audit
+        # file intact but never migrate its weights into the corrected target.
+        self.path = Path(state_dir).resolve() / "shadow-calibration.v2.json"
         self.learning_rate = _clip(learning_rate, 0.001, 0.1)
         self.minimum_samples = max(10, int(minimum_samples))
         self.minimum_promotion_samples = max(
@@ -59,7 +61,7 @@ class ShadowCalibrator:
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
             return {
-                "schema_version": "ocean-wave-shadow-calibration.v1",
+                "schema_version": "ocean-wave-shadow-calibration.v2",
                 "updated_at": None,
                 "global": _new_bucket(),
                 "symbols": {},
@@ -67,7 +69,7 @@ class ShadowCalibrator:
                 "valid_training_days": [],
             }
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "ocean-wave-shadow-calibration.v1":
+        if payload.get("schema_version") != "ocean-wave-shadow-calibration.v2":
             raise ValueError("invalid shadow calibration state")
         return payload
 
@@ -149,15 +151,9 @@ class ShadowCalibrator:
         projected = (1.0 - symbol_weight) * global_value + symbol_weight * self._project_bucket(symbol_bucket, raw)
         total_samples = int(global_bucket.get("samples", 0))
         readiness = min(1.0, total_samples / float(self.minimum_samples))
-        # A shadow fit is never allowed to manufacture stronger conviction.
-        # Even after the sample gate is met, retain a 5% shrink toward neutral.
-        shrink_strength = 0.25 + 0.70 * readiness
-        conservative = 0.5 + (projected - 0.5) * shrink_strength
-        conservative_boundary = 0.5 + (raw - 0.5) * 0.95
-        if raw >= 0.5:
-            calibrated = _clip(conservative, 0.5, conservative_boundary)
-        else:
-            calibrated = _clip(conservative, conservative_boundary, 0.5)
+        # Properly labelled losses may move a forecast across 0.5. The former
+        # same-side clamp made systematic directional mistakes unlearnable.
+        calibrated = (1.0 - readiness) * raw + readiness * projected
         valid_days = len({str(value) for value in self.state.get("valid_training_days", [])})
         promotion_eligible = (
             total_samples >= self.minimum_promotion_samples
@@ -180,7 +176,7 @@ class ShadowCalibrator:
         symbol_bucket = self.state.get("symbols", {}).get(symbol.upper(), _new_bucket())
         valid_days = len({str(value) for value in self.state.get("valid_training_days", [])})
         return {
-            "schema_version": "ocean-wave-shadow-calibration.v1",
+            "schema_version": "ocean-wave-shadow-calibration.v2",
             "status": status or ("duplicate_ignored" if duplicate else "updated"),
             "deployment_status": "shadow_only",
             "global_samples": int(global_bucket.get("samples", 0)),

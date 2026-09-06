@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 from math import exp, isfinite
 from typing import Any, Mapping
 
+from ._backend import cpp_core
+
 
 STANDARD_EQUITY_OPTION_UNIT_ASSUMPTIONS: dict[str, str] = {
     "underlying_price": "usd_per_share",
@@ -54,6 +56,8 @@ class ContractValueScenario:
     round_trip_spread_cost: float
     round_trip_fee_per_share: float
     net_edge_after_spread: float
+    probability_profit_after_costs: float | None = None
+    probability_profit_before_fees: float | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,7 @@ class ContractValueOverlay:
     bull_iv_stress: ContractValueScenario | None
     bear_iv_stress: ContractValueScenario | None
     reasons: tuple[str, ...]
+    return_variance_source: str = "declared_simple_return"
 
 
 @dataclass(frozen=True)
@@ -97,9 +102,11 @@ class ContractAssessment:
 
 
 def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if isfinite(number) else None
 
@@ -183,9 +190,12 @@ def assess_contract_value(
 ) -> ContractValueOverlay:
     """Estimate option-premium change without feeding it into the model.
 
-    ``expected_return`` is a decimal simple return and ``return_variance`` is
-    its dimensionless variance.  With premium quoted in USD per option share,
-    the approximation is::
+    ``expected_return`` is a decimal simple return. If the expectation supplies
+    ``price_variance``, its simple-return variance is ``price_variance / S**2``;
+    Ocean Wave's raw ``return_variance`` is a log-return variance and must not
+    be mixed with a simple-return mean. External expectations without a price
+    variance use the explicit unit schema's simple-return variance.
+    With premium quoted in USD per option share, the approximation is::
 
         E[dV] = delta*S*mu
               + 0.5*gamma*S**2*(variance + mu**2)
@@ -214,8 +224,8 @@ def assess_contract_value(
 
     expected_return = _number(getattr(expectation, "expected_return", None))
     return_variance = _number(getattr(expectation, "return_variance", None))
+    variance_source = "declared_simple_return"
     require(expected_return is not None and expected_return > -1.0, "missing_or_invalid_expected_return")
-    require(return_variance is not None and return_variance >= 0.0, "missing_or_invalid_return_variance")
 
     underlying_price = _contract_number(contract, "underlying_price", "spot")
     if underlying_price is None:
@@ -225,6 +235,16 @@ def assess_contract_value(
         if expected_price is not None:
             underlying_price = expected_price / (1.0 + expected_return)
     require(underlying_price is not None and underlying_price > 0.0, "missing_or_invalid_underlying_price")
+    if hasattr(expectation, "price_variance"):
+        variance_source = "price_variance_divided_by_spot_squared"
+        price_variance = _number(getattr(expectation, "price_variance", None))
+        return_variance = None
+        if price_variance is not None and underlying_price is not None and underlying_price > 0.0:
+            # Divide twice instead of forming spot**2, which can overflow for
+            # invalid external inputs before the supported-range gate below.
+            return_variance = _number((price_variance / underlying_price) / underlying_price)
+        require(price_variance is not None and price_variance >= 0.0, "missing_or_invalid_price_variance")
+    require(return_variance is not None and return_variance >= 0.0, "missing_or_invalid_return_variance")
 
     bid = _number(contract.get("bid"))
     ask = _number(contract.get("ask"))
@@ -265,13 +285,34 @@ def assess_contract_value(
         checks.append(False)
 
     require(bool(exact_match), "contract_not_exactly_matched")
-    completeness = sum(checks) / len(checks) if checks else 0.0
+    # Match native supported units/ranges before doing arithmetic. A malformed
+    # contract produces an unavailable overlay rather than aborting a snapshot.
+    for value, limit, name in (
+        (underlying_price, 1e7, "underlying_price"),
+        (expected_return, 2.0, "expected_return"),
+        (return_variance, 4.0, "return_variance"),
+        (delta, 1.0, "delta"),
+        (gamma, 1e4, "gamma"),
+        (vega, 1e7, "vega"),
+    ):
+        if value is not None:
+            require(abs(value) <= limit, f"unsupported_{name}_range")
+    if theta is not None and horizon is not None:
+        theta_pnl = theta * (horizon / 390.0)
+        require(isfinite(theta_pnl) and abs(theta_pnl) <= 1e7, "unsupported_theta_pnl_range")
+    if bid is not None and ask is not None:
+        require(ask - bid <= 1e7, "unsupported_round_trip_spread_range")
+    if fee is not None and multiplier is not None and multiplier > 0.0:
+        per_share = fee / multiplier
+        require(isfinite(per_share) and per_share <= 1e7, "unsupported_fee_per_share_range")
+    if stresses is not None:
+        require(all(abs(change) <= 10.0 for change in stresses.values()), "unsupported_iv_stress_range")
     formula = (
         "E[dV]=Delta*S*mu+0.5*Gamma*S^2*(variance+mu^2)+"
         "Theta*(H/390)+Vega*dIV; net=E[dV]-(ask-bid)-round_trip_fee/multiplier"
     )
 
-    if reasons:
+    def unavailable() -> ContractValueOverlay:
         return ContractValueOverlay(
             schema_version="ocean-wave-contract-value-shadow.v1",
             deployment_status="shadow_only",
@@ -282,7 +323,7 @@ def assess_contract_value(
             underlying_return_variance=return_variance,
             underlying_price=underlying_price,
             current_iv_decimal=current_iv,
-            data_completeness=completeness,
+            data_completeness=sum(checks) / len(checks) if checks else 0.0,
             unit_assumptions=units,
             formula=formula,
             net_edge_after_spread=None,
@@ -290,7 +331,11 @@ def assess_contract_value(
             bull_iv_stress=None,
             bear_iv_stress=None,
             reasons=tuple(reasons),
+            return_variance_source=variance_source,
         )
+
+    if reasons:
+        return unavailable()
 
     # The guards above make these values concrete.  Local aliases keep the
     # arithmetic readable without weakening validation or inventing defaults.
@@ -315,6 +360,18 @@ def assess_contract_value(
         # changes are therefore multiplied by 100 before applying vega.
         vega_component = vega * iv_change * 100.0
         gross_change = delta_component + gamma_component + theta_component + vega_component
+        probability = probability_gross = None
+        if cpp_core is not None and hasattr(cpp_core, "option_profit_probability"):
+            arguments = (underlying_price, expected_return, return_variance, delta, gamma,
+                         theta_component, vega, iv_change * 100.0, spread_cost)
+            net = cpp_core.option_profit_probability(*arguments, fee_per_share)
+            gross = net if fee_per_share == 0.0 else cpp_core.option_profit_probability(*arguments, 0.0)
+            probability = _number(net.get("probability_profit"))
+            probability_gross = _number(gross.get("probability_profit"))
+            if (net.get("available") is not True or gross.get("available") is not True
+                    or probability is None or not 0.0 <= probability <= 1.0
+                    or probability_gross is None or not 0.0 <= probability_gross <= 1.0):
+                raise ValueError("native profit probability is unavailable")
         return ContractValueScenario(
             iv_change_decimal=iv_change,
             delta_component=delta_component,
@@ -325,11 +382,17 @@ def assess_contract_value(
             round_trip_spread_cost=spread_cost,
             round_trip_fee_per_share=fee_per_share,
             net_edge_after_spread=gross_change - spread_cost - fee_per_share,
+            probability_profit_after_costs=probability,
+            probability_profit_before_fees=probability_gross,
         )
 
-    base = scenario(stresses["base"])
-    bull = scenario(stresses["bull"])
-    bear = scenario(stresses["bear"])
+    try:
+        base = scenario(stresses["base"])
+        bull = scenario(stresses["bull"])
+        bear = scenario(stresses["bear"])
+    except (RuntimeError, ValueError, OverflowError):
+        require(False, "native_profit_probability_unavailable")
+        return unavailable()
     return ContractValueOverlay(
         schema_version="ocean-wave-contract-value-shadow.v1",
         deployment_status="shadow_only",
@@ -340,7 +403,7 @@ def assess_contract_value(
         underlying_return_variance=return_variance,
         underlying_price=underlying_price,
         current_iv_decimal=current_iv,
-        data_completeness=completeness,
+        data_completeness=sum(checks) / len(checks) if checks else 0.0,
         unit_assumptions=units,
         formula=formula,
         net_edge_after_spread=base.net_edge_after_spread,
@@ -348,6 +411,7 @@ def assess_contract_value(
         bull_iv_stress=bull,
         bear_iv_stress=bear,
         reasons=(),
+        return_variance_source=variance_source,
     )
 
 

@@ -1,0 +1,13 @@
+include README.md CHANGELOG.md CODEX_PROMPT.md CMakeLists.txt requirements.txt
+recursive-include cpp *.hpp *.cpp
+recursive-include option_wave *.py
+recursive-include examples *.py
+recursive-include benchmarks *.py
+recursive-include tests *.py *.cpp
+include docs/model.md docs/data_integration.md
+include scripts/realtime_worker.py scripts/validate_native_core.py
+global-exclude __pycache__ *.py[cod] *.pyd *.so *.dll *.exe *.obj *.pdb
+prune build
+prune dist
+prune .git
+prune .venv

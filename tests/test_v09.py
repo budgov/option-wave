@@ -21,6 +21,12 @@ from option_wave import (
 )
 from option_wave._backend import cpp_core
 from option_wave.elo import EloConfig, energy_cost, build_symmetric_pairs
+from option_wave.realtime import (
+    audit_option_chain,
+    execution_quote_projection,
+    extract_target_contract_quote,
+    target_quote_eligible,
+)
 
 
 def chain(spread: float = 0.10) -> pd.DataFrame:
@@ -51,6 +57,58 @@ def chain(spread: float = 0.10) -> pd.DataFrame:
 
 
 class OceanWaveTests(unittest.TestCase):
+    def test_target_quote_survives_unrelated_chain_quality_quarantine(self) -> None:
+        frame = pd.DataFrame([{
+            "strike": 760.0,
+            "expiry_days": 0.0,
+            "expiry_date": "2026-09-02",
+            "call_bid": 5.8,
+            "call_ask": 5.9,
+            "put_bid": 0.09,
+            "put_ask": 0.10,
+            "put_last": 0.10,
+            "put_quote_timestamp": "2026-09-02T15:40:59.105Z",
+            "call_iv": 0.2,
+            "put_iv": 0.4,
+            "call_delta": 0.9,
+            "put_delta": -0.1,
+            "call_gamma": 0.01,
+            "put_gamma": 0.01,
+            "call_vega": 0.05,
+            "put_vega": -1.0,
+            "call_theta": -0.01,
+            "put_theta": -0.01,
+            "call_oi": 1000,
+            "put_oi": 2000,
+        }])
+        audit = audit_option_chain(frame, 765.87)
+        self.assertFalse(audit.accepted)
+        self.assertIn("put_invalid_vega", audit.reasons)
+        target, resolved_expiry, inferred, observed_at = extract_target_contract_quote(
+            frame, "2026-09-02", 760.0, "put"
+        )
+        self.assertEqual(resolved_expiry, "2026-09-02")
+        self.assertFalse(inferred)
+        self.assertEqual(target["matched"]["bid"], 0.09)
+        self.assertEqual(target["matched"]["ask"], 0.10)
+        self.assertTrue(target_quote_eligible(target))
+        self.assertTrue(observed_at.startswith("2026-09-02T15:40:59.105"))
+        audit_target = execution_quote_projection(target)
+        self.assertTrue(audit_target["execution_audit_only"])
+        self.assertEqual(audit_target["matched"]["bid"], 0.09)
+        self.assertNotIn("vega", audit_target["matched"])
+        self.assertNotIn("open_interest", audit_target["matched"])
+        target_without_time = {
+            **target,
+            "matched": {**target["matched"], "quote_timestamp": None},
+        }
+        self.assertFalse(target_quote_eligible(target_without_time))
+        neighboring_target, _, _, _ = extract_target_contract_quote(
+            frame, "2026-09-02", 761.0, "put"
+        )
+        self.assertFalse(neighboring_target["exact_strike_match"])
+        self.assertFalse(target_quote_eligible(neighboring_target))
+
     def test_symmetric_pair_is_relative_not_same_strike(self) -> None:
         pairs = build_symmetric_pairs(chain(), spot=100.0)
         match = pairs[(pairs.expiry_days == 0) & np.isclose(pairs.distance_pct, 0.05)]

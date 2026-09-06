@@ -7,7 +7,7 @@ daemon, or moomoo/OpenD dependency.  The default adapter targets the Massive
 be used with a different vendor's JSON response.
 
 API credentials must be supplied at runtime.  They are never read from a
-checked-in file and should be exposed to a Cloudflare Worker as a secret.
+checked-in file; provide them through runtime environment or secret management.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import os
 import re
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,7 @@ import pandas as pd
 from .inverse import InverseMarketData, InverseRegistry
 from .factors import ShortData
 from .model import MarketState
+from .http_security import HTTPURLPolicyError, build_https_opener, resolve_https_url
 
 
 class HTTPAPIError(RuntimeError):
@@ -126,9 +127,16 @@ class MassiveHTTPClient:
     ) -> None:
         self.config = config or HTTPAPIConfig()
         self._transport = transport
+        try:
+            self._opener = build_https_opener(self.config.base_url)
+        except HTTPURLPolicyError as exc:
+            raise HTTPAPIError(str(exc)) from None
 
     def _url(self, path: str, params: Mapping[str, Any] | None = None) -> str:
-        url = path if path.startswith("http://") or path.startswith("https://") else self.config.base_url.rstrip("/") + "/" + path.lstrip("/")
+        try:
+            url = resolve_https_url(self.config.base_url, path)
+        except HTTPURLPolicyError as exc:
+            raise HTTPAPIError(str(exc)) from None
         query = dict(params or {})
         if self.config.api_key:
             query.setdefault(self.config.api_key_parameter, self.config.api_key)
@@ -141,13 +149,13 @@ class MassiveHTTPClient:
             if not isinstance(payload, Mapping):
                 raise HTTPAPIError("transport returned a non-object JSON payload")
             return payload
-        request = Request(url, headers={"Accept": "application/json", "User-Agent": "ocean-wave/1.0"})
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "ocean-wave/1.1"})
         try:
-            with urlopen(request, timeout=max(float(self.config.timeout_seconds), 0.1)) as response:
+            with self._opener.open(request, timeout=max(float(self.config.timeout_seconds), 0.1)) as response:
                 status = getattr(response, "status", 200)
                 raw = response.read()
-        except Exception as exc:  # pragma: no cover - depends on network/provider
-            raise HTTPAPIError(f"market-data request failed: {exc}") from exc
+        except Exception:  # Never retain a provider exception containing the API-key URL.
+            raise HTTPAPIError("market-data request failed") from None
         if status >= 400:
             raise HTTPAPIError(f"market-data request returned HTTP {status}")
         try:
@@ -169,9 +177,10 @@ class MassiveHTTPClient:
             if isinstance(page, list):
                 results.extend(item for item in page if isinstance(item, Mapping))
             raw_next = payload.get("next_url")
-            next_url = str(raw_next) if raw_next else None
-            if next_url and self.config.api_key and self.config.api_key_parameter not in dict(parse_qsl(urlsplit(next_url).query)):
-                next_url = _append_query(next_url, {self.config.api_key_parameter: self.config.api_key})
+            try:
+                next_url = resolve_https_url(self.config.base_url, raw_next, relative_to=next_url) if raw_next else None
+            except HTTPURLPolicyError as exc:
+                raise HTTPAPIError(str(exc)) from None
         return results
 
     @staticmethod

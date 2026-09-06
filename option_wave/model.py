@@ -66,7 +66,12 @@ class EventContext:
 
 @dataclass
 class PDEConfig:
-    """Coefficients for the semi-discrete advection-diffusion-reaction PDE."""
+    """Signed-score PDE; these coefficients are not probability-density terms.
+
+    Time is minutes, distance is a return fraction, expiry is days. Diffusion
+    uses coordinate squared/minute, drift distance/minute, reaction 1/minute.
+    Zero normal gradient is imposed on both ends of both spatial axes.
+    """
 
     distance_diffusion: float = 0.015
     expiry_diffusion: float = 0.010
@@ -234,12 +239,81 @@ def _surface_grid(surface: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.nda
     return distances, expiries, field_grid, weight_grid
 
 
-def _gradient_and_laplacian(field_grid: np.ndarray, coordinates: np.ndarray, axis: int) -> tuple[np.ndarray, np.ndarray]:
-    if len(coordinates) < 2:
-        zeros = np.zeros_like(field_grid)
-        return zeros, zeros
-    gradient = np.gradient(field_grid, coordinates, axis=axis, edge_order=1)
-    return gradient, np.gradient(gradient, coordinates, axis=axis, edge_order=1)
+class _ImplicitPDEStepper:
+    """Python reference for the allocation-bounded C++ implicit score solver."""
+
+    def __init__(self, observed: np.ndarray, distances: np.ndarray, expiries: np.ndarray, config: PDEConfig):
+        self.observed = np.asarray(observed, dtype=float)
+        self.config = config
+        self.axes = []
+        if (self.observed.shape != (len(expiries), len(distances)) or not self.observed.size
+                or self.observed.size > 1_000_000 or not np.all(np.isfinite(self.observed))
+                or np.any(np.abs(self.observed) > 1.0)):
+            raise ValueError("PDE field dimensions or values are invalid")
+        if (not np.isfinite(config.decay) or config.decay < 0.0
+                or not np.isfinite(config.source_strength) or config.source_strength < 0.0):
+            raise ValueError("PDE reaction coefficients must be finite and nonnegative")
+        for coordinates, diffusion, drift, axis in (
+            (distances, config.distance_diffusion, config.distance_drift, 1),
+            (expiries, config.expiry_diffusion, 0.0, 0),
+        ):
+            coordinates = np.asarray(coordinates, dtype=float)
+            spacing = np.diff(coordinates)
+            if (coordinates.ndim != 1 or not np.all(np.isfinite(coordinates))
+                    or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0.0)
+                    or not np.isfinite(diffusion) or diffusion < 0.0 or not np.isfinite(drift)):
+                raise ValueError("PDE coordinates must be strictly increasing and coefficients finite")
+            left = np.zeros(len(coordinates))
+            right = np.zeros(len(coordinates))
+            for index in range(len(coordinates)):
+                before = spacing[index - 1] if index > 0 else 0.0
+                after = spacing[index] if index + 1 < len(coordinates) else 0.0
+                width = 0.5 * before + 0.5 * after
+                if index > 0:
+                    left[index] = (diffusion / width + max(drift, 0.0)) / before
+                if index + 1 < len(coordinates):
+                    right[index] = (diffusion / width + max(-drift, 0.0)) / after
+            if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+                raise ValueError("PDE grid spacing exceeds the finite numerical range")
+            self.axes.append((axis, left, right, np.empty_like(left), np.empty_like(left), np.empty_like(left)))
+        self.factored_dt = None
+
+    def advance(self, field_grid: np.ndarray, timestep: float) -> np.ndarray:
+        if not np.isfinite(timestep) or timestep <= 0.0:
+            raise ValueError("PDE timestep must be finite and positive")
+        if field_grid.shape != self.observed.shape or not np.all(np.isfinite(field_grid)):
+            raise ValueError("PDE field dimensions or values are invalid")
+        if timestep != self.factored_dt:
+            for _, left, right, inverse, lower, upper in self.axes:
+                previous_gap = 1.0
+                for index in range(len(left)):
+                    scaled_left = timestep * left[index]
+                    scaled_right = timestep * right[index]
+                    remainder = 1.0 + scaled_left * previous_gap
+                    pivot = remainder + scaled_right
+                    if not np.isfinite(pivot) or pivot <= 0.0:
+                        raise ValueError("PDE timestep and grid exceed the finite numerical range")
+                    inverse[index] = 1.0 / pivot
+                    lower[index] = scaled_left / pivot
+                    upper[index] = scaled_right / pivot
+                    previous_gap = remainder / pivot
+            self.factored_dt = timestep
+        denominator = 1.0 + timestep * self.config.decay + timestep * self.config.source_strength
+        if not np.isfinite(denominator):
+            raise ValueError("PDE reaction exceeds the finite numerical range")
+        result = (1.0 / denominator) * field_grid + (
+            (timestep * self.config.source_strength) / denominator
+        ) * self.observed
+        for axis, _, _, inverse, lower, upper in self.axes:
+            lines = result.T if axis == 1 else result
+            lines[0] *= inverse[0]
+            for index in range(1, len(inverse)):
+                lines[index] = lines[index] * inverse[index] + lower[index] * lines[index - 1]
+            for index in range(len(inverse) - 2, -1, -1):
+                lines[index] += upper[index] * lines[index + 1]
+        if not np.all(np.isfinite(result)):
+            raise ValueError("PDE produced a non-finite score field")
+        return result
 
 
 def _advance_pde(
@@ -250,16 +324,73 @@ def _advance_pde(
     config: PDEConfig,
     timestep: float,
 ) -> np.ndarray:
-    gradient_distance, laplacian_distance = _gradient_and_laplacian(field_grid, distances, axis=1)
-    _, laplacian_expiry = _gradient_and_laplacian(field_grid, expiries, axis=0)
-    derivative = (
-        -config.distance_drift * gradient_distance
-        + config.distance_diffusion * laplacian_distance
-        + config.expiry_diffusion * laplacian_expiry
-        - config.decay * field_grid
-        + config.source_strength * (observed - field_grid)
-    )
-    return np.clip(field_grid + timestep * derivative, -1.0, 1.0)
+    return _ImplicitPDEStepper(observed, distances, expiries, config).advance(field_grid, timestep)
+
+
+def _evolve_pde(
+    observed: np.ndarray,
+    weights: np.ndarray,
+    distances: np.ndarray,
+    expiries: np.ndarray,
+    config: PDEConfig,
+    horizons: Sequence[float],
+    retain_scores: bool = False,
+) -> dict[str, np.ndarray]:
+    """Integrate exactly to the final horizon; interpolate fractional integrals.
+
+    Only requested output and one score field are retained by default. Returned
+    scores, when requested, use regular time steps plus a shorter final step.
+    """
+    requested = np.asarray(horizons, dtype=float)
+    dt = float(config.timestep_minutes)
+    if (requested.ndim != 1 or not len(requested) or len(requested) > 10_000
+            or not np.all(np.isfinite(requested)) or np.any(requested <= 0.0)
+            or not np.isfinite(dt) or dt <= 0.0):
+        raise ValueError("forecast horizons or timestep are invalid")
+    raw_steps = np.ceil(np.max(requested) / dt)
+    if not np.isfinite(raw_steps) or raw_steps < 1 or raw_steps > 1_000_000:
+        raise ValueError("forecast step count exceeds the safety limit")
+    steps = int(raw_steps)
+    stepper = _ImplicitPDEStepper(observed, distances, expiries, config)
+    field_grid = stepper.observed.copy()
+    if field_grid.size * steps > 100_000_000:
+        raise ValueError("forecast workload exceeds the safety limit")
+    weights = np.asarray(weights, dtype=float)
+    if weights.shape != field_grid.shape or not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("PDE weights must be finite, nonnegative, and match the field")
+    normalized_weights = np.maximum(weights, EPS)
+    normalized_weights /= np.max(normalized_weights)
+    normalized_weights /= np.sum(normalized_weights)
+    order = np.argsort(requested, kind="stable")
+    next_horizon = 0
+    previous_score = float(np.sum(field_grid * normalized_weights))
+    scores = [previous_score] if retain_scores else []
+    integrals = np.empty(len(requested))
+    averages = np.empty(len(requested))
+    integrated = 0.0
+    previous_time = 0.0
+    final_time = float(np.max(requested))
+    for step in range(1, steps + 1):
+        time = final_time if step == steps else min(step * dt, final_time)
+        step_dt = time - previous_time
+        if step_dt <= 0.0:
+            continue
+        field_grid = stepper.advance(field_grid, step_dt)
+        score = float(np.sum(field_grid * normalized_weights))
+        if retain_scores:
+            scores.append(score)
+        while next_horizon < len(order) and requested[order[next_horizon]] <= time:
+            index = order[next_horizon]
+            horizon = requested[index]
+            partial = horizon - previous_time
+            partial_score = previous_score + (score - previous_score) * (partial / step_dt)
+            integrals[index] = integrated + 0.5 * (previous_score + partial_score) * partial
+            averages[index] = integrals[index] / horizon
+            next_horizon += 1
+        integrated += 0.5 * (previous_score + score) * step_dt
+        previous_score = score
+        previous_time = time
+    return {"field": field_grid, "scores": np.asarray(scores), "integrals": integrals, "averages": averages}
 
 
 def _normal_cdf(value: float) -> float:
@@ -608,7 +739,7 @@ class OceanWave:
         if not horizons or horizons[0] <= 0.0:
             raise ValueError("horizons_minutes must contain positive values")
         pde_config, gamma_multiplier = self._dynamic_pde_config(chain_summary)
-        timestep = max(float(pde_config.timestep_minutes), 1e-3)
+        timestep = float(pde_config.timestep_minutes)
         volatility = self._volatility(chain, state, chain_summary)
         expectations: dict[float, Expectation] = {}
         if HAS_CPP_CORE and hasattr(cpp_core, "forecast_surface"):
@@ -683,24 +814,10 @@ class OceanWave:
             basis_mean = _weighted_mean(source_basis.ravel(), grid_weights.ravel())
             source_basis /= max(basis_mean, EPS)
             observed = np.clip(observed + (blend.signal - current_field_signal) * source_basis, -1.0, 1.0)
-            steps = int(np.ceil(max(horizons) / timestep))
-            field_grid = observed.copy()
-            scores = np.empty(steps + 1, dtype=float)
-            scores[0] = _weighted_mean(field_grid.ravel(), grid_weights.ravel())
-            for step in range(1, steps + 1):
-                field_grid = _advance_pde(field_grid, observed, distances, expiries, pde_config, timestep)
-                scores[step] = _weighted_mean(field_grid.ravel(), grid_weights.ravel())
-            integrated_values = []
-            average_values = []
-            trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-            for horizon in horizons:
-                index = min(int(np.ceil(horizon / timestep)), steps)
-                elapsed = np.arange(index + 1, dtype=float) * timestep
-                integral = float(trapezoid(scores[: index + 1], elapsed))
-                integrated_values.append(integral)
-                average_values.append(integral / max(float(elapsed[-1]), EPS))
-            integrated_values = np.asarray(integrated_values)
-            average_values = np.asarray(average_values)
+            evolution = _evolve_pde(observed, grid_weights, distances, expiries, pde_config, horizons)
+            field_grid = evolution["field"]
+            integrated_values = evolution["integrals"]
+            average_values = evolution["averages"]
             mean_pair_variance = _weighted_mean(surface["pair_variance"].to_numpy(float), surface["pair_weight"].to_numpy(float))
             liquidity_risk = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
             for horizon, integrated, average in zip(horizons, integrated_values, average_values):

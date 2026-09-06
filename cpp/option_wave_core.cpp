@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ocean_wave_kernels.hpp"
+#include "online_forecast.hpp"
 
 namespace py = pybind11;
 using DoubleArray = py::array_t<double, py::array::c_style | py::array::forcecast>;
@@ -1156,8 +1157,92 @@ py::dict extract_intraday_fourier_features(
     return result;
 }
 
+py::dict online_forecast_predict(const std::vector<double>& packed_state,
+    const std::vector<double>& stock, const std::vector<double>& options,
+    double quality, double horizon_minutes) {
+    ocean_wave::online::Prediction prediction;
+    {
+        py::gil_scoped_release release;
+        prediction = ocean_wave::online::predict(ocean_wave::online::State::unpack(packed_state),
+            stock, options, quality, horizon_minutes);
+    }
+    py::dict result;
+    result["frozen_native"] = prediction.pack();
+    result["expert_probabilities"] = prediction.probabilities;
+    result["expert_weights"] = prediction.weights;
+    result["probability_up"] = prediction.probability;
+    result["expected_return"] = prediction.expected_return;
+    result["return_scale"] = prediction.scale;
+    result["interval_lower_return"] = prediction.lower_return;
+    result["interval_upper_return"] = prediction.upper_return;
+    result["interval_multiplier"] = prediction.interval_multiplier;
+    result["trained_samples"] = prediction.trained_samples;
+    result["option_quality"] = prediction.quality;
+    result["change_score"] = prediction.change_score;
+    return result;
+}
+
+py::dict online_forecast_learn(const std::vector<double>& packed_state,
+    const std::vector<double>& frozen_forecast, double actual_return,
+    bool replay = false, double horizon_minutes = 30.0) {
+    ocean_wave::online::State state;
+    {
+        py::gil_scoped_release release;
+        const auto prior = ocean_wave::online::State::unpack(packed_state);
+        const auto frozen = ocean_wave::online::Prediction::unpack(frozen_forecast);
+        state = replay ? ocean_wave::online::learn_replay(prior, frozen, actual_return, horizon_minutes)
+            : ocean_wave::online::learn(prior, frozen, actual_return);
+    }
+    py::dict result;
+    result["native_state"] = state.pack();
+    result["trained_samples"] = state.samples;
+    result["direction_score"] = state.direction_score;
+    result["brier_sums"] = state.brier_sum;
+    result["interval_hits"] = state.interval_hits;
+    result["change_score"] = state.change_score;
+    return result;
+}
+
+py::dict option_profit_probability(double spot, double mean_return, double return_variance,
+    double delta, double gamma, double theta_pnl,
+    double vega_per_vol_point, double iv_shock_vol_points, double round_trip_spread,
+    double fees_per_share) {
+    ocean_wave::online::OptionProfit profit;
+    {
+        py::gil_scoped_release release;
+        profit = ocean_wave::online::option_profit_probability(spot, mean_return, return_variance,
+            delta, gamma, theta_pnl, vega_per_vol_point,
+            iv_shock_vol_points, round_trip_spread, fees_per_share);
+    }
+    py::dict result;
+    result["available"] = true;
+    result["approximation"] = "delta_gamma_normal";
+    result["probability_profit"] = profit.probability_profit;
+    result["expected_net_pnl"] = profit.expected_net_pnl;
+    result["pnl_variance"] = profit.pnl_variance;
+    result["pnl_unit"] = "per_underlying_share";
+    return result;
+}
+
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ numerical core for the Ocean Wave model";
+    module.attr("ONLINE_FORECAST_VERSION") = "online_forecast.v1";
+    module.attr("ONLINE_FORECAST_STATE_SIZE") = ocean_wave::online::State::SIZE;
+    module.attr("ONLINE_FORECAST_FROZEN_SIZE") = ocean_wave::online::Prediction::SIZE;
+    module.def("online_forecast_initial_state", [] { return ocean_wave::online::State{}.pack(); });
+    module.def("online_forecast_validate_state", [](const std::vector<double>& state) {
+        return ocean_wave::online::State::unpack(state).pack();
+    });
+    module.def("online_forecast_predict", &online_forecast_predict,
+        py::arg("state"), py::arg("stock"), py::arg("options"), py::arg("quality"), py::arg("horizon_minutes"));
+    module.def("online_forecast_learn", &online_forecast_learn,
+        py::arg("state"), py::arg("frozen_forecast"), py::arg("actual_return"),
+        py::arg("replay") = false, py::arg("horizon_minutes") = 30.0);
+    module.def("option_profit_probability", &option_profit_probability,
+        py::arg("spot"), py::arg("mean_return"), py::arg("return_variance"),
+        py::arg("delta"), py::arg("gamma"), py::arg("theta_pnl"),
+        py::arg("vega_per_vol_point"),
+        py::arg("iv_shock_vol_points"), py::arg("round_trip_spread"), py::arg("fees_per_share"));
     module.attr("FOURIER_MIN_SAMPLES") = ocean_wave::FOURIER_MIN_SAMPLES;
     module.attr("FOURIER_MAX_SAMPLES") = ocean_wave::FOURIER_MAX_SAMPLES;
     module.attr("FOURIER_MAX_HARMONICS") = ocean_wave::FOURIER_MAX_HARMONICS;

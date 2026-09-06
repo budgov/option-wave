@@ -277,7 +277,7 @@ inline int checked_grid_size(std::size_t rows, std::size_t cols) {
 }
 
 inline int checked_step_count(const std::vector<double>& horizons, double timestep) {
-    if (horizons.empty() || !std::isfinite(timestep) || timestep <= 0.0 || !all_finite(horizons)
+    if (horizons.empty() || horizons.size() > 10'000 || !std::isfinite(timestep) || timestep <= 0.0 || !all_finite(horizons)
         || std::any_of(horizons.begin(), horizons.end(), [](double value) { return value <= 0.0; })) {
         throw std::runtime_error("forecast horizons or timestep are invalid");
     }
@@ -369,54 +369,78 @@ inline StockConfirmation stock_confirmation(
     };
 }
 
-inline void gradient_axis(
-    const std::vector<double>& field,
-    int rows,
-    int cols,
-    const std::vector<double>& coordinates,
-    int axis,
-    std::vector<double>& output
-) {
-    output.assign(field.size(), 0.0);
-    if ((axis == 0 && rows < 2) || (axis == 1 && cols < 2)) return;
-    for (int row = 0; row < rows; ++row) {
-        for (int col = 0; col < cols; ++col) {
-            const int index = row * cols + col;
-            const int position = axis == 1 ? col : row;
-            const int length = axis == 1 ? cols : rows;
-            const int stride = axis == 1 ? 1 : cols;
-            if (position == 0) {
-                const double span = coordinates[1] - coordinates[0];
-                output[index] = span > EPSILON ? (field[index + stride] - field[index]) / span : 0.0;
-            } else if (position == length - 1) {
-                const double span = coordinates[length - 1] - coordinates[length - 2];
-                output[index] = span > EPSILON ? (field[index] - field[index - stride]) / span : 0.0;
-            } else {
-                const double left_span = coordinates[position] - coordinates[position - 1];
-                const double right_span = coordinates[position + 1] - coordinates[position];
-                const double denominator = left_span * right_span * (left_span + right_span);
-                output[index] = denominator > EPSILON
-                    ? (-right_span * right_span * field[index - stride]
-                       + (right_span * right_span - left_span * left_span) * field[index]
-                       + left_span * left_span * field[index + stride]) / denominator
-                    : 0.0;
+// This evolves a signed score, not a probability density. Distance is a return
+// fraction, expiry is in days, and time is in minutes: diffusion coefficients
+// have coordinate^2/minute units; drift has distance/minute units. Both ends
+// use zero normal gradient (closed diffusive flux, constant ghost for drift).
+struct ImplicitAxis {
+    std::vector<double> left, right, inverse_pivot, lower_factor, upper_factor;
+
+    ImplicitAxis(const std::vector<double>& coordinates, double diffusion, double drift)
+        : left(coordinates.size(), 0.0), right(coordinates.size(), 0.0),
+          inverse_pivot(coordinates.size()), lower_factor(coordinates.size()),
+          upper_factor(coordinates.size()) {
+        if (coordinates.empty() || !all_finite(coordinates) || !std::isfinite(diffusion)
+            || diffusion < 0.0 || !std::isfinite(drift)) {
+            throw std::runtime_error("PDE coordinates or coefficients are invalid");
+        }
+        for (std::size_t i = 1; i < coordinates.size(); ++i) {
+            if (!(coordinates[i] > coordinates[i - 1])
+                || !std::isfinite(coordinates[i] - coordinates[i - 1])) {
+                throw std::runtime_error("PDE coordinates must be finite and strictly increasing");
+            }
+        }
+        if (coordinates.size() == 1) return;
+        for (std::size_t i = 0; i < coordinates.size(); ++i) {
+            const double before = i > 0 ? coordinates[i] - coordinates[i - 1] : 0.0;
+            const double after = i + 1 < coordinates.size() ? coordinates[i + 1] - coordinates[i] : 0.0;
+            const double cell_width = 0.5 * before + 0.5 * after;
+            if (i > 0) left[i] = (diffusion / cell_width + std::max(drift, 0.0)) / before;
+            if (i + 1 < coordinates.size()) right[i] = (diffusion / cell_width + std::max(-drift, 0.0)) / after;
+            if (!std::isfinite(left[i]) || !std::isfinite(right[i])) {
+                throw std::runtime_error("PDE grid spacing exceeds the finite numerical range");
             }
         }
     }
-}
 
-inline void laplacian_axis(
-    const std::vector<double>& field,
-    int rows,
-    int cols,
-    const std::vector<double>& coordinates,
-    int axis,
-    std::vector<double>& scratch,
-    std::vector<double>& output
-) {
-    gradient_axis(field, rows, cols, coordinates, axis, scratch);
-    gradient_axis(scratch, rows, cols, coordinates, axis, output);
-}
+    void factor(double dt) {
+        double previous_gap = 1.0;
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            const double lower = dt * left[i];
+            const double upper = dt * right[i];
+            // Avoid subtracting nearly equal large numbers in the Thomas
+            // pivot: 1 + lower + upper - lower * previous_upper.
+            const double remainder = 1.0 + lower * previous_gap;
+            const double pivot = remainder + upper;
+            if (!std::isfinite(pivot) || pivot <= 0.0) {
+                throw std::runtime_error("PDE timestep and grid exceed the finite numerical range");
+            }
+            inverse_pivot[i] = 1.0 / pivot;
+            lower_factor[i] = lower / pivot;
+            upper_factor[i] = upper / pivot;
+            previous_gap = remainder / pivot;
+        }
+    }
+
+    void solve(std::vector<double>& field, int rows, int cols, bool distance_axis) const {
+        const int length = distance_axis ? cols : rows;
+        const int lines = distance_axis ? rows : cols;
+        const int stride = distance_axis ? 1 : cols;
+        for (int line = 0; line < lines; ++line) {
+            const int start = distance_axis ? line * cols : line;
+            field[start] *= inverse_pivot[0];
+            for (int i = 1; i < length; ++i) {
+                const int index = start + i * stride;
+                field[index] = field[index] * inverse_pivot[i]
+                    + lower_factor[i] * field[index - stride];
+            }
+            for (int i = length - 2; i >= 0; --i) {
+                const int index = start + i * stride;
+                field[index] += upper_factor[i] * field[index + stride];
+            }
+        }
+    }
+};
 
 struct Evolution {
     std::vector<double> field;
@@ -443,48 +467,91 @@ inline Evolution evolve(
     const int rows = static_cast<int>(expiries.size());
     const int cols = static_cast<int>(distances.size());
     if (observed.size() != static_cast<std::size_t>(size) || weights.size() != observed.size()
-        || !all_finite(observed) || !all_finite(weights) || !all_finite(distances) || !all_finite(expiries)) {
+        || !all_finite(observed) || !all_finite(weights) || !all_finite(distances) || !all_finite(expiries)
+        || std::any_of(observed.begin(), observed.end(), [](double value) { return std::abs(value) > 1.0; })) {
         throw std::runtime_error("forecast field arrays or horizons are invalid");
     }
-    const double dt = std::max(timestep_minutes, 1e-6);
+    if (!std::isfinite(decay) || decay < 0.0 || !std::isfinite(source_strength) || source_strength < 0.0
+        || std::any_of(weights.begin(), weights.end(), [](double value) { return value < 0.0; })) {
+        throw std::runtime_error("PDE reaction coefficients and weights must be finite and nonnegative");
+    }
+    const double dt = timestep_minutes;
     const int steps = checked_step_count(horizons, dt);
     constexpr long long max_work_items = 100'000'000;
     if (static_cast<long long>(size) * steps > max_work_items) {
         throw std::runtime_error("forecast workload exceeds the safety limit");
     }
-    std::vector<double> field = observed;
-    std::vector<double> next(size);
-    std::vector<double> scores(steps + 1);
-    std::vector<double> lap_distance, lap_expiry, gradient_distance, distance_scratch, expiry_scratch;
-    scores[0] = weighted_mean(field, weights);
-    for (int step = 1; step <= steps; ++step) {
-        laplacian_axis(field, rows, cols, distances, 1, distance_scratch, lap_distance);
-        laplacian_axis(field, rows, cols, expiries, 0, expiry_scratch, lap_expiry);
-        gradient_axis(field, rows, cols, distances, 1, gradient_distance);
-        for (int i = 0; i < size; ++i) {
-            const double derivative = -distance_drift * gradient_distance[i]
-                + distance_diffusion * lap_distance[i]
-                + expiry_diffusion * lap_expiry[i]
-                - decay * field[i]
-                + source_strength * (observed[i] - field[i]);
-            next[i] = clamp(field[i] + dt * derivative, -1.0, 1.0);
-        }
-        field.swap(next);
-        scores[step] = weighted_mean(field, weights);
-    }
+    ImplicitAxis distance_axis(distances, distance_diffusion, distance_drift);
+    ImplicitAxis expiry_axis(expiries, expiry_diffusion, 0.0);
     Evolution result;
-    result.field = std::move(field);
-    result.integrals.reserve(horizons.size());
-    result.averages.reserve(horizons.size());
-    for (const double horizon : horizons) {
-        const int index = std::min(steps, static_cast<int>(std::ceil(horizon / dt)));
-        double integral = 0.0;
-        for (int i = 1; i <= index; ++i) integral += 0.5 * (scores[i] + scores[i - 1]) * dt;
-        const double elapsed = std::max(index * dt, EPSILON);
-        result.integrals.push_back(integral);
-        result.averages.push_back(integral / elapsed);
+    result.field = observed;
+    result.integrals.resize(horizons.size());
+    result.averages.resize(horizons.size());
+    if (retain_scores) result.scores.reserve(steps + 1);
+    // Normalize once: repeated scores need only a dot product, and even finite
+    // near-DBL_MAX weights cannot overflow the weight sum. Preserve the public
+    // EPS floor, including uniform weighting when all supplied weights are 0.
+    std::vector<double> normalized_weights(weights.size());
+    const double weight_scale = std::max(*std::max_element(weights.begin(), weights.end()), EPSILON);
+    double weight_sum = 0.0;
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        normalized_weights[i] = std::max(weights[i], EPSILON) / weight_scale;
+        weight_sum += normalized_weights[i];
     }
-    if (retain_scores) result.scores = std::move(scores);
+    for (double& weight : normalized_weights) weight /= weight_sum;
+    const auto score_mean = [&]() {
+        double value = 0.0;
+        for (std::size_t i = 0; i < result.field.size(); ++i) {
+            if (!std::isfinite(result.field[i])) throw std::runtime_error("PDE produced a non-finite score field");
+            value += result.field[i] * normalized_weights[i];
+        }
+        return value;
+    };
+    std::vector<std::pair<double, std::size_t>> ordered_horizons;
+    ordered_horizons.reserve(horizons.size());
+    for (std::size_t i = 0; i < horizons.size(); ++i) ordered_horizons.emplace_back(horizons[i], i);
+    std::sort(ordered_horizons.begin(), ordered_horizons.end());
+    std::size_t next_horizon = 0;
+    double previous_score = score_mean();
+    if (retain_scores) result.scores.push_back(previous_score);
+    double integrated = 0.0;
+    double previous_time = 0.0;
+    double factored_dt = -1.0;
+    const double final_time = ordered_horizons.back().first;
+    for (int step = 1; step <= steps; ++step) {
+        const double time = step == steps ? final_time : std::min(step * dt, final_time);
+        const double step_dt = time - previous_time;
+        if (step_dt <= 0.0) continue;
+        if (step_dt != factored_dt) {
+            distance_axis.factor(step_dt);
+            expiry_axis.factor(step_dt);
+            factored_dt = step_dt;
+        }
+        const double denominator = 1.0 + step_dt * decay + step_dt * source_strength;
+        if (!std::isfinite(denominator)) throw std::runtime_error("PDE reaction exceeds the finite numerical range");
+        const double retained = 1.0 / denominator;
+        const double sourced = (step_dt * source_strength) / denominator;
+        for (int i = 0; i < size; ++i) {
+            result.field[i] = retained * result.field[i] + sourced * observed[i];
+        }
+        // A product of backward-Euler resolvents is first-order consistent
+        // with the original PDE and preserves its maximum principle, without
+        // the grid-dependent explicit CFL limit or artificial score clipping.
+        distance_axis.solve(result.field, rows, cols, true);
+        expiry_axis.solve(result.field, rows, cols, false);
+        const double score = score_mean();
+        if (retain_scores) result.scores.push_back(score);
+        while (next_horizon < ordered_horizons.size() && ordered_horizons[next_horizon].first <= time) {
+            const auto [horizon, index] = ordered_horizons[next_horizon++];
+            const double partial = horizon - previous_time;
+            const double partial_score = previous_score + (score - previous_score) * (partial / step_dt);
+            result.integrals[index] = integrated + 0.5 * (previous_score + partial_score) * partial;
+            result.averages[index] = result.integrals[index] / horizon;
+        }
+        integrated += 0.5 * (previous_score + score) * step_dt;
+        previous_score = score;
+        previous_time = time;
+    }
     return result;
 }
 
@@ -538,7 +605,7 @@ inline Forecast forecast_surface(
         || !std::isfinite(trading_minutes_per_year) || trading_minutes_per_year <= 0.0) {
         throw std::runtime_error("forecast surface rows are invalid");
     }
-    checked_step_count(horizons, std::max(timestep_minutes, 1e-6));
+    checked_step_count(horizons, timestep_minutes);
     Forecast result;
     result.distances = row_distance;
     result.expiries = row_expiry;

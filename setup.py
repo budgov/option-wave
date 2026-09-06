@@ -1,7 +1,7 @@
 import os
 import sys
 
-from setuptools import find_packages, setup
+from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 
@@ -17,8 +17,8 @@ if os.getenv("OCEAN_WAVE_NATIVE") == "1" and sys.platform not in {"darwin", "win
 
 setup(
     name="ocean-wave",
-    version="1.0.0",
-    packages=find_packages(),
+    version="1.1.0",
+    packages=["option_wave"],
     ext_modules=[
         Pybind11Extension(
             "option_wave._core",

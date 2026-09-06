@@ -256,6 +256,14 @@ b(d,\tau)=e^{-|d|/0.08}e^{-\tau/45},qquad
 u_t=\psi_{ELO}+b(d,\tau)(z_t-\bar\psi_{ELO}).
 \]
 
+The field is a signed score in \([-1,1]\), not a price probability density.
+Distance \(d\) is a return fraction (0.01 means 1%), expiry \(\tau\) is in
+days, and evolution time \(t\) is in minutes. Thus \(D_d\) has units of
+return-fraction squared/minute, \(D_\tau\) days squared/minute, \(v_d\)
+return-fraction/minute, and \(\lambda,\kappa\) inverse minutes. The projected
+source basis is normalized by its observed-weight mean, and the initial/source
+score \(u_t\) is restricted to \([-1,1]\) before integration.
+
 The field evolves as
 
 \[
@@ -271,19 +279,46 @@ The field evolves as
 Negative GEX increases source amplification; positive GEX damps it. Wide
 spreads and VRP stress increase diffusion/forecast variance.
 
-After finite-difference discretization of \((d,\tau)\),
+Both ends of each coordinate axis use homogeneous Neumann conditions
+\(\partial_n\psi=0\): no diffusive boundary flux and a constant ghost value
+for advection. For adjacent distances \(h_-=d_i-d_{i-1}\) and
+\(h_+=d_{i+1}-d_i\), the nonuniform finite-volume diffusion is
 
 \[
-\dot{\mathbf x}_t=A_t\mathbf x_t+B_t\mathbf f_t+\boldsymbol\varepsilon_t,
+(L_d x)_i=\frac{D_d}{(h_-+h_+)/2}
+\left[\frac{x_{i+1}-x_i}{h_+}-\frac{x_i-x_{i-1}}{h_-}\right].
 \]
 
-and the implemented explicit step is
+Endpoint control volumes have half the adjacent spacing and their outer
+flux is zero. Expiry diffusion uses the same stencil. Drift uses the upwind
+neighbor selected by the sign of \(v_d\); singleton axes have zero spatial
+operator. This diffusion conserves the control-volume-weighted score, while
+the signed-score advection is not a density-conservation equation.
+
+The implemented step is a product of backward-Euler solves:
 
 \[
-\boxed{\mathbf x_{n+1}=(I+\Delta t A_t)\mathbf x_n+\Delta t B_t\mathbf f_t}.
+\boxed{\mathbf x_{n+1}=(I-\Delta t L_\tau)^{-1}
+(I-\Delta t L_d)^{-1}
+\frac{\mathbf x_n+\Delta t\kappa\mathbf u}{1+\Delta t(\lambda+\kappa)}}.
 \]
 
-The C++ kernel operates directly on contiguous arrays. It constructs the
+Each tridiagonal system has nonnegative inverse entries and preserves
+constants. For nonnegative diffusion, decay and source strength, the combined
+step obeys the score maximum principle without output clipping. It is
+first-order accurate in time; implicit stability does not remove the need for
+step-size and grid-convergence checks. Coefficients retain their configured
+values and require out-of-sample calibration; numerical stability alone does
+not validate predictive accuracy.
+
+The C++ kernel operates directly on contiguous arrays. The Thomas factors and
+normalized aggregation weights are reused across equal-sized steps. Working
+storage is linear in grid size, and each step is linear work; there are no
+adaptive substep loops. Scores are retained only on explicit request. Invalid
+coefficients, unordered/duplicate coordinates, non-finite values, negative
+weights, more than one million grid cells/steps, more than 10,000 horizons, or
+more than 100 million cell-steps are rejected before integration.
+It constructs the
 strike-expiry grid, projects the global factor signal, evolves the PDE, and
 integrates all requested horizons in one call. The Python implementation is a
 portable numerical reference rather than the production hot path.
@@ -300,6 +335,13 @@ For integration weight \(W(d,\tau)\),
 \[
 I_H=\int_0^H\bar\psi(t)dt,qquad \bar\psi_H=I_H/H.
 \]
+
+Trapezoidal quadrature integrates the piecewise-linear score trajectory at
+each requested horizon, including fractional steps. The final field stops at
+the exact largest horizon; it never advances to a later rounded-up time. The
+optional score array contains the initial score, regular step scores, and a
+shorter final step when needed. Existing integral/average/field result keys
+are unchanged.
 
 Expected log return is
 
@@ -387,6 +429,17 @@ E[\Delta V]=\Delta S\mu_H+\frac12\Gamma S^2(V_H+\mu_H^2)
 +\Theta H/390+100\mathcal V\,\Delta IV.
 \]
 
+Here the contract overlay uses **simple-return** mean and variance, unlike the
+log-return parameters in section 10. For an Ocean Wave expectation, it converts
+\(V_H^{simple}=\operatorname{Var}(S_H)/S_t^2\); an external expectation without
+price variance must explicitly declare simple-return variance units. Profit
+probability solves the quadratic Delta/Gamma payoff under a normal
+approximation to this simple return, conditional on the stated IV scenario.
+Theta, spread, and per-share fees shift the payoff threshold. This is an
+approximation, not the underlying's favorable-direction probability. Invalid
+native ranges or missing required units/Greeks/fees yield an unavailable
+overlay; native unavailability never substitutes a direction probability.
+
 The executable edge subtracts one round-trip spread and per-share fees:
 
 \[
@@ -433,7 +486,41 @@ b\leftarrow\operatorname{clip}(b+\eta_n(y-\hat p)\operatorname{logit}(p),.5,1.5)
 \]
 
 Event identifiers make feedback idempotent. Invalid sessions do not mutate
-state, and the projected probability is constrained toward 0.5 so calibration
-cannot manufacture stronger conviction. The default promotion gate requires
-500 mature samples and 40 valid trading days; callers may configure a separate
-research threshold explicitly.
+state. In calibration v2, verified losses can move the probability across 0.5;
+the former same-side shrinkage restriction has been removed. Readiness blends
+the raw and fitted probabilities until the sample threshold is reached.
+Legacy v1 files mixed direction and option-profit targets and are not migrated.
+The default promotion eligibility counters require 500 mature samples and 40
+valid trading days. These counters do not perform deployment or establish
+out-of-sample profitability; promotion remains an external research decision.
+
+## 16. Supervised online challenger
+
+`OnlineForecastChallenger` maintains independent, bounded state for each
+supported symbol (QQQ, SPY, TSLA, AAPL) and forecast horizon. The numerical
+kernels are implemented in `cpp/online_forecast.hpp`; Python validates input
+schemas, causal timestamps, immutable receipts and checkpoint integrity.
+
+The stock model is a regularized logistic predictor. The conditional model
+adds regularized option features after removing their fitted stock-feature
+component in log-odds space. Trend and reversion experts are additional
+comparators. Hedge-style weights are updated from their issued-time Brier
+losses, not from contemporaneous premium ELO or binary score totals. Missing
+features have explicit masks; no signed dealer flow is inferred from volume.
+
+Prediction does not train the model. Every receipt freezes raw features,
+probabilities, expert weights, expected return and an interval. `learn` requires
+a mature, eligible outcome; duplicate forecast/event identifiers and stale
+outcomes do not update state. Callers must verify price alignment and session
+eligibility. A positive realized return is the up label; zero is not-up.
+
+`learn_replay` can rebuild from an eligible ledger after invalidating a session.
+It re-encodes the original raw features against the current learning state for
+gradients, while scoring experts and interval coverage against the original
+frozen predictions. It never replaces a historical forecast with hindsight.
+
+EWMA return statistics, change diagnostics and a 256-observation scaled-error
+buffer support adaptive intervals. This is not a guarantee of conditional
+coverage or a claim that market prices follow a stable physical law. Fourier
+features are causal diagnostics, not extrapolated deterministic price cycles.
+The challenger remains shadow-only and does not place trades or promote itself.
