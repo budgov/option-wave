@@ -13,14 +13,28 @@
 namespace ocean_wave::online {
 
 constexpr std::size_t STOCK_COUNT = 8;
-constexpr std::size_t OPTION_COUNT = 5;
+// Eleven measured option-structure features, followed by seven cross-asset
+// features. Premium ELO is a learned input, never a fixed percentage budget.
+constexpr std::size_t OPTION_ONLY_COUNT = 11;
+constexpr std::size_t CONTEXT_COUNT = 7;
+constexpr std::size_t OPTION_COUNT = OPTION_ONLY_COUNT + CONTEXT_COUNT;
 constexpr std::size_t FEATURE_COUNT = STOCK_COUNT + OPTION_COUNT;
 constexpr std::size_t STOCK_DESIGN = 1 + 2 * STOCK_COUNT;
-constexpr std::size_t OPTION_DESIGN = 2 * OPTION_COUNT;
-constexpr std::size_t EXPERT_COUNT = 4;
+constexpr std::size_t OPTION_INTERACTIONS = 3;
+constexpr std::size_t OPTION_DESIGN = 2 * OPTION_COUNT + OPTION_INTERACTIONS;
+constexpr std::size_t EXPERT_COUNT = 5;
 constexpr std::size_t CALIBRATION_CAPACITY = 256;
 constexpr std::size_t MIN_SAMPLES = 32;
 constexpr double COUNT_LIMIT = 1e9;
+constexpr double HEDGE_ETA = 0.05;
+constexpr double HEDGE_PRIOR_REVERSION = 0.001;
+constexpr double HEDGE_LOG_MINIMUM = -8.0;
+constexpr double CONDITIONAL_LOGIT_LIMIT = 4.0;
+constexpr double MISSING_INDICATOR_SCALE = 0.25;
+
+inline bool context_design(std::size_t index) {
+    return index < 2 * OPTION_COUNT && index % OPTION_COUNT >= OPTION_ONLY_COUNT;
+}
 
 inline double bounded(double value, double low, double high) {
     return std::max(low, std::min(high, value));
@@ -153,8 +167,19 @@ struct Prediction {
     std::array<double, OPTION_DESIGN> residual{};
     std::array<double, OPTION_COUNT> option_z{};
     std::array<double, EXPERT_COUNT> probabilities{}, weights{};
+    // Explanations are pre-clip log-odds terms, not portfolio/factor weights.
+    // They need not be packed for gradients; the JSON receipt digest freezes
+    // the returned explanation alongside the packed numerical observation.
+    std::array<double, STOCK_DESIGN> stock_logit_contributions{};
+    std::array<double, OPTION_DESIGN> option_logit_contributions{};
+    double stock_logit = 0.0;
+    double option_logit_increment = 0.0;
+    double context_logit_increment = 0.0;
+    double option_feature_coverage = 0.0;
     double raw_stock_probability = 0.5;
     double raw_fused_probability = 0.5;
+    double raw_context_probability = 0.5;
+    double context_quality = 0.0;
     double quality = 0.0;
     double probability = 0.5;
     double expected_return = 0.0;
@@ -166,7 +191,7 @@ struct Prediction {
     double interval_multiplier = 2.0;
 
     static constexpr std::size_t SIZE = 2 * FEATURE_COUNT + STOCK_DESIGN
-        + OPTION_DESIGN + OPTION_COUNT + 2 * EXPERT_COUNT + 11;
+        + OPTION_DESIGN + OPTION_COUNT + 2 * EXPERT_COUNT + 14;
 
     std::vector<double> pack() const {
         std::vector<double> result;
@@ -178,7 +203,8 @@ struct Prediction {
         append(probabilities); append(weights);
         result.insert(result.end(), {raw_stock_probability, raw_fused_probability,
             quality, probability, expected_return, scale, lower_return, upper_return,
-            trained_samples, change_score, interval_multiplier});
+            trained_samples, change_score, interval_multiplier,
+            raw_context_probability, context_quality, option_feature_coverage});
         return result;
     }
 
@@ -201,6 +227,8 @@ struct Prediction {
         p.lower_return = values[cursor++]; p.upper_return = values[cursor++];
         p.trained_samples = values[cursor++]; p.change_score = values[cursor++];
         p.interval_multiplier = values[cursor++];
+        p.raw_context_probability = values[cursor++]; p.context_quality = values[cursor++];
+        p.option_feature_coverage = values[cursor++];
         for (const double value : p.seen) if (value != 0.0 && value != 1.0) {
             throw std::runtime_error("frozen feature mask is invalid");
         }
@@ -220,6 +248,9 @@ struct Prediction {
             || p.quality < 0.0 || p.quality > 1.0 || p.probability < 0.0 || p.probability > 1.0
             || p.raw_stock_probability < 0.0 || p.raw_stock_probability > 1.0
             || p.raw_fused_probability < 0.0 || p.raw_fused_probability > 1.0
+            || p.raw_context_probability < 0.0 || p.raw_context_probability > 1.0
+            || p.context_quality < 0.0 || p.context_quality > 1.0
+            || p.option_feature_coverage < 0.0 || p.option_feature_coverage > 1.0
             || p.lower_return > p.upper_return || p.trained_samples < 0.0
             || p.trained_samples > COUNT_LIMIT || p.trained_samples != std::floor(p.trained_samples)
             || p.interval_multiplier < 0.5 || p.interval_multiplier > 25.0) {
@@ -233,15 +264,18 @@ struct Prediction {
 // These ex-ante scale floors prevent tiny samples or flat histories amplifying noise.
 constexpr std::array<double, FEATURE_COUNT> SCALE_FLOOR{
     0.002, 0.004, 0.003, 0.5, 0.002, 0.002, 0.10, 0.01,
-    0.05, 0.15, 0.25, 0.25, 0.25
+    0.25, 0.25, 0.05, 0.15, 0.05, 1.0, 0.10, 0.25, 0.10, 0.20, 2.0,
+    0.002, 0.004, 0.002, 2.0, 0.001, 0.5, 5.0
 };
 constexpr std::array<double, FEATURE_COUNT> INITIAL_MEAN{
     0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.25, 0.0,
-    0.0, 0.25, 0.0, 0.0, 0.0
+    0.0, 0.75, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.20, 0.75, 8.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0
 };
 constexpr std::array<double, FEATURE_COUNT> RAW_LIMIT{
     2.0, 2.0, 2.0, 1000.0, 2.0, 2.0, 10.0, 2.0,
-    10.0, 10.0, 1.0, 1.0, 1.0
+    1.0, 1.0, 10.0, 10.0, 10.0, 100.0, 10.0, 1.0, 1.0, 1.0, 30.0,
+    2.0, 2.0, 2.0, 500.0, 2.0, 100.0, 200.0
 };
 
 inline double normalize(const State& state, std::size_t index, double value) {
@@ -261,39 +295,81 @@ inline Prediction predict(const State& state, const std::vector<double>& stock,
     Prediction p;
     p.x[0] = 1.0;
     std::size_t options_seen = 0;
+    std::size_t context_seen = 0;
     for (std::size_t index = 0; index < FEATURE_COUNT; ++index) {
         const double value = index < STOCK_COUNT ? stock[index] : options[index - STOCK_COUNT];
         p.seen[index] = std::isfinite(value) ? 1.0 : 0.0;
         p.raw[index] = p.seen[index] ? bounded(value, -RAW_LIMIT[index], RAW_LIMIT[index]) : 0.0;
-        if ((index == 3 || index == 6 || index == 9) && p.raw[index] < 0.0) {
+        const bool nonnegative = index == 3 || index == 6 || index == STOCK_COUNT + 1
+            || index == STOCK_COUNT + 3 || index == STOCK_COUNT + 8
+            || index == STOCK_COUNT + 9 || index == STOCK_COUNT + 10 || index == FEATURE_COUNT - 1;
+        const bool unit_interval = index == STOCK_COUNT + 1 || index == STOCK_COUNT + 8 || index == STOCK_COUNT + 9;
+        if ((nonnegative && value < 0.0) || (unit_interval && value > 1.0)) {
             p.seen[index] = 0.0; p.raw[index] = 0.0;
         }
         if (index < STOCK_COUNT) {
             p.x[index + 1] = p.seen[index] ? normalize(state, index, p.raw[index]) : 0.0;
-            p.x[index + 1 + STOCK_COUNT] = 1.0 - p.seen[index];
+            p.x[index + 1 + STOCK_COUNT] = MISSING_INDICATOR_SCALE * (1.0 - p.seen[index]);
         }
+    }
+    // ELO reliability must be measured, not guessed from option coverage. Its
+    // scalar coefficient is learned; confidence only gates this observation.
+    if (!p.seen[STOCK_COUNT + 1] || p.raw[STOCK_COUNT + 1] <= 0.0) {
+        p.seen[STOCK_COUNT] = 0.0;
+        p.raw[STOCK_COUNT] = 0.0;
     }
     for (std::size_t index = 0; index < OPTION_COUNT; ++index) {
         if (p.seen[STOCK_COUNT + index]) {
-            ++options_seen;
+            if (index < OPTION_ONLY_COUNT) ++options_seen; else ++context_seen;
             p.option_z[index] = normalize(state, STOCK_COUNT + index, p.raw[STOCK_COUNT + index]);
             // Conditioning coefficients and scaler contain mature observations only.
             p.residual[index] = bounded(p.option_z[index] - dot(state.residual_weights[index], p.x), -4.0, 4.0);
         }
-        p.residual[index + OPTION_COUNT] = 1.0 - p.seen[STOCK_COUNT + index];
+        p.residual[index + OPTION_COUNT] = MISSING_INDICATOR_SCALE * (1.0 - p.seen[STOCK_COUNT + index]);
+    }
+    if (p.seen[STOCK_COUNT]) p.residual[0] *= p.raw[STOCK_COUNT + 1];
+    // Causal interactions: each requires its measured parents. No lookahead,
+    // static dealer-position sign, or new synthetic measurement is introduced.
+    if (p.seen[STOCK_COUNT] && p.seen[STOCK_COUNT + 2]) {
+        p.residual[2 * OPTION_COUNT] = bounded(p.residual[0] * p.option_z[2], -4.0, 4.0);
+    }
+    if (p.seen[STOCK_COUNT] && p.seen[STOCK_COUNT + 8]) {
+        p.residual[2 * OPTION_COUNT + 1] = bounded(p.residual[0] * p.raw[STOCK_COUNT + 8], -4.0, 4.0);
+    }
+    if (p.seen[0] && p.seen[STOCK_COUNT + 4]) {
+        p.residual[2 * OPTION_COUNT + 2] = bounded(p.x[1] * p.option_z[4], -4.0, 4.0);
     }
     p.trained_samples = state.samples;
     const double shrink = state.samples / (state.samples + 32.0);
-    p.quality = options_seen ? quality * static_cast<double>(options_seen) / OPTION_COUNT : 0.0;
-    const double stock_logit = bounded(dot(state.stock_weights, p.x), -4.0, 4.0);
-    p.raw_stock_probability = logistic(stock_logit);
-    const double increment = p.quality * bounded(dot(state.option_weights, p.residual), -0.5, 0.5);
-    p.raw_fused_probability = logistic(stock_logit + increment);
+    p.option_feature_coverage = static_cast<double>(options_seen) / OPTION_ONLY_COUNT;
+    // Coverage is diagnostic, not a second amplitude penalty. Absent fields
+    // already disable their own values. New optional columns must not dilute
+    // an existing valid ELO/IV measurement merely by enlarging a denominator.
+    p.quality = options_seen > 0 ? quality : 0.0;
+    p.context_quality = static_cast<double>(context_seen) / CONTEXT_COUNT;
+    for (std::size_t index = 0; index < STOCK_DESIGN; ++index) {
+        p.stock_logit_contributions[index] = state.stock_weights[index] * p.x[index];
+    }
+    p.stock_logit = bounded(dot(state.stock_weights, p.x), -4.0, 4.0);
+    p.raw_stock_probability = logistic(p.stock_logit);
+    double option_logit = 0.0, context_logit = 0.0;
+    for (std::size_t index = 0; index < OPTION_DESIGN; ++index) {
+        const double term = state.option_weights[index] * p.residual[index];
+        const bool context = context_design(index);
+        p.option_logit_contributions[index] = (context ? p.context_quality : p.quality) * term;
+        if (context) context_logit += term;
+        else option_logit += term;
+    }
+    p.option_logit_increment = p.quality * bounded(option_logit, -CONDITIONAL_LOGIT_LIMIT, CONDITIONAL_LOGIT_LIMIT);
+    p.context_logit_increment = p.context_quality * bounded(context_logit, -CONDITIONAL_LOGIT_LIMIT, CONDITIONAL_LOGIT_LIMIT);
+    p.raw_fused_probability = logistic(p.stock_logit + p.option_logit_increment);
+    p.raw_context_probability = logistic(p.stock_logit + p.context_logit_increment);
     p.probabilities[0] = 0.5 + shrink * (p.raw_stock_probability - 0.5);
     p.probabilities[1] = 0.5 + shrink * (p.raw_fused_probability - 0.5);
     const double momentum = 0.65 * p.x[1] + 0.35 * p.x[2];
-    p.probabilities[2] = 0.5 + 0.15 * shrink * std::tanh(momentum);
-    p.probabilities[3] = 0.5 - 0.15 * shrink * std::tanh(p.x[3]);
+    p.probabilities[2] = 0.5 + shrink * (p.raw_context_probability - 0.5);
+    p.probabilities[3] = 0.5 + 0.15 * shrink * std::tanh(momentum);
+    p.probabilities[4] = 0.5 - 0.15 * shrink * std::tanh(p.x[3]);
     double total_weight = 0.0;
     for (std::size_t index = 0; index < EXPERT_COUNT; ++index) {
         p.weights[index] = std::exp(state.log_weights[index]);
@@ -301,8 +377,9 @@ inline Prediction predict(const State& state, const std::vector<double>& stock,
     }
     p.probability = 0.0;
     for (std::size_t index = 0; index < EXPERT_COUNT; ++index) {
-        // A 10% probability mass floor per expert prevents permanent extinction.
-        p.weights[index] = 0.1 + 0.6 * p.weights[index] / total_weight;
+        // Frozen prequential Brier loss selects experts. Bounded log weights
+        // and weak prior reversion allow recovery without a hard 10% floor.
+        p.weights[index] /= total_weight;
         p.probability += p.weights[index] * p.probabilities[index];
     }
     const double realized = p.seen[6] ? bounded(p.raw[6], 0.01, 5.0) : 0.25;
@@ -335,27 +412,46 @@ inline State learn(const State& prior, const Prediction& p, double actual_return
         throw std::runtime_error("online state is exhausted or predates the frozen forecast");
     }
     State state = prior;
-    // A zero return is a tie (soft target 1/2), not a directional win or loss.
-    const double target = actual_return > 0.0 ? 1.0 : (actual_return < 0.0 ? 0.0 : 0.5);
+    // Match the runtime's +1/-1 rule: a flat outcome belongs to "not up".
+    const double target = actual_return > 0.0 ? 1.0 : 0.0;
     const double rate = 0.04 / std::sqrt(1.0 + state.samples / 128.0);
-    const double stock_norm = 1.0 + dot(p.x, p.x);
+    // L2-normalized SGD has bounded updates without squaring away the signal.
+    // Only measured value terms set the scale; merely adding absent columns
+    // must not suppress learning. Small explicit missing indicators remain
+    // learnable, but are not confused with measured zeros.
+    double stock_norm = 1.0;
+    for (std::size_t index = 1; index <= STOCK_COUNT; ++index) stock_norm += p.x[index] * p.x[index];
+    stock_norm = std::sqrt(stock_norm);
     for (std::size_t index = 0; index < STOCK_DESIGN; ++index) {
         const double gradient = (p.raw_stock_probability - target) * p.x[index] / stock_norm;
-        const double regularizer = index == 0 ? 0.0 : 0.01 * state.stock_weights[index];
+        const double regularizer = index == 0 ? 0.0 : 0.005 * state.stock_weights[index];
         state.stock_weights[index] = bounded(state.stock_weights[index] - rate * (gradient + regularizer), -4.0, 4.0);
     }
-    const double option_norm = 1.0 + dot(p.residual, p.residual);
+    double option_norm = 1.0, context_norm = 1.0;
     for (std::size_t index = 0; index < OPTION_DESIGN; ++index) {
-        const double gradient = p.quality * (p.raw_fused_probability - target) * p.residual[index] / option_norm;
+        if (index >= OPTION_COUNT && index < 2 * OPTION_COUNT) continue;
+        const double squared = p.residual[index] * p.residual[index];
+        if (context_design(index)) context_norm += squared;
+        else option_norm += squared;
+    }
+    option_norm = std::sqrt(option_norm);
+    context_norm = std::sqrt(context_norm);
+    for (std::size_t index = 0; index < OPTION_DESIGN; ++index) {
+        const bool context = context_design(index);
+        const double gate = context ? p.context_quality : p.quality;
+        const double probability = context ? p.raw_context_probability : p.raw_fused_probability;
+        const double gradient = gate * (probability - target) * p.residual[index]
+            / (context ? context_norm : option_norm);
         state.option_weights[index] = bounded(state.option_weights[index]
-            - rate * (gradient + 0.02 * state.option_weights[index]), -2.0, 2.0);
+            - rate * (gradient + 0.005 * state.option_weights[index]), -2.0, 2.0);
     }
     for (std::size_t option = 0; option < OPTION_COUNT; ++option) {
-        if (!p.seen[STOCK_COUNT + option] || p.quality <= 0.0) continue;
+        const double gate = option < OPTION_ONLY_COUNT ? p.quality : p.context_quality;
+        if (!p.seen[STOCK_COUNT + option] || gate <= 0.0) continue;
         const double residual_error = bounded(dot(state.residual_weights[option], p.x) - p.option_z[option], -4.0, 4.0);
         for (std::size_t index = 0; index < STOCK_DESIGN; ++index) {
             state.residual_weights[option][index] = bounded(state.residual_weights[option][index]
-                - 0.08 * p.quality * (residual_error * p.x[index] / stock_norm
+                - 0.08 * gate * (residual_error * p.x[index] / stock_norm
                     + 0.005 * state.residual_weights[option][index]), -4.0, 4.0);
         }
     }
@@ -363,15 +459,14 @@ inline State learn(const State& prior, const Prediction& p, double actual_return
         const double error = p.probabilities[index] - target;
         const double loss = error * error;
         state.brier_sum[index] += loss;
-        // Hedge uses frozen issue-time probabilities; eta=0.05 caps one-event
-        // log-weight movement. It is deliberately separate from legacy ELO.
-        state.log_weights[index] -= 0.05 * loss;
+        // Prequential loss is genuinely out-of-sample at the issue timestamp.
+        // A weak, explicit prior reversion lets formerly weak experts recover.
+        // It does not impose a minimum expert percentage or promote a model.
+        state.log_weights[index] = (1.0 - HEDGE_PRIOR_REVERSION) * state.log_weights[index] - HEDGE_ETA * loss;
     }
     const double maximum = *std::max_element(state.log_weights.begin(), state.log_weights.end());
-    for (double& weight : state.log_weights) weight = bounded(weight - maximum, -8.0, 0.0);
-    if (target != 0.5 && p.probability != 0.5) {
-        state.direction_score += ((p.probability > 0.5) == (target > 0.5)) ? 1.0 : -1.0;
-    }
+    for (double& weight : state.log_weights) weight = bounded(weight - maximum, HEDGE_LOG_MINIMUM, 0.0);
+    state.direction_score += ((p.probability > 0.5) == (target > 0.5)) ? 1.0 : -1.0;
     const double surprise = state.samples >= 8.0
         ? std::abs(actual_return - state.return_mean) / std::max(std::sqrt(state.return_variance), 1e-5) : 0.0;
     state.change_score = bounded(0.95 * state.change_score + 0.05 * std::max(0.0, surprise - 2.0), 0.0, 20.0);
@@ -387,7 +482,9 @@ inline State learn(const State& prior, const Prediction& p, double actual_return
     state.calibration_cursor = std::fmod(state.calibration_cursor + 1.0, static_cast<double>(CALIBRATION_CAPACITY));
     state.calibration_count = std::min(state.calibration_count + 1.0, static_cast<double>(CALIBRATION_CAPACITY));
     for (std::size_t index = 0; index < FEATURE_COUNT; ++index) {
-        if (!p.seen[index] || (index >= STOCK_COUNT && p.quality <= 0.0)) continue;
+        if (!p.seen[index]) continue;
+        if (index >= STOCK_COUNT && index < STOCK_COUNT + OPTION_ONLY_COUNT && p.quality <= 0.0) continue;
+        if (index >= STOCK_COUNT + OPTION_ONLY_COUNT && p.context_quality <= 0.0) continue;
         state.count[index] += 1.0;
         const double delta = p.raw[index] - state.mean[index];
         state.mean[index] += delta / state.count[index];
@@ -401,17 +498,15 @@ inline State learn_replay(const State& state, const Prediction& frozen,
     double actual_return, double horizon_minutes) {
     const double missing = std::numeric_limits<double>::quiet_NaN();
     std::vector<double> stock(STOCK_COUNT), options(OPTION_COUNT);
-    std::size_t options_seen = 0;
     for (std::size_t index = 0; index < STOCK_COUNT; ++index) {
         stock[index] = frozen.seen[index] ? frozen.raw[index] : missing;
     }
     for (std::size_t index = 0; index < OPTION_COUNT; ++index) {
         const bool seen = frozen.seen[STOCK_COUNT + index] != 0.0;
         options[index] = seen ? frozen.raw[STOCK_COUNT + index] : missing;
-        options_seen += seen ? 1 : 0;
     }
-    const double input_quality = options_seen
-        ? bounded(frozen.quality * OPTION_COUNT / options_seen, 0.0, 1.0) : 0.0;
+    // V3 stores evidence quality directly; coverage is a separate diagnostic.
+    const double input_quality = frozen.quality;
     // Re-encoding happens at the label time, solely for gradient updates. It is
     // never represented as a newly issued historical forecast. This permits
     // overlapping horizons and rebuilding after invalid-session removal.

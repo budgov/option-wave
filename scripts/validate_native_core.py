@@ -36,12 +36,28 @@ def parity_check(core) -> dict[str, object]:
     for name in (
         "forecast_surface", "evolve_field", "extract_intraday_fourier",
         "online_forecast_initial_state", "online_forecast_validate_state",
-        "online_forecast_predict", "online_forecast_learn", "option_profit_probability",
+        "online_forecast_predict", "online_forecast_learn", "option_profit_probability", "blend_factor_budgets",
+        "extract_chain_factors",
     ):
         if not callable(getattr(core, name, None)):
             raise RuntimeError(f"required native symbol is missing: {name}")
-    if getattr(core, "ONLINE_FORECAST_VERSION", None) != "online_forecast.v1":
+    if getattr(core, "ONLINE_FORECAST_VERSION", None) != "online_forecast.v3":
         raise RuntimeError("online forecast native version contract failed")
+    if any(hasattr(core, name) for name in ("blend_factors", "aggregate_flow", "aggregate_flow_risk", "compute_short_factor")):
+        raise RuntimeError("retired directional native API is still present")
+    if core.ONLINE_FORECAST_STATE_SIZE != 715 or core.ONLINE_FORECAST_FROZEN_SIZE != 150:
+        raise RuntimeError("v3 online state/receipt dimensions do not match")
+    receipt = core.online_forecast_predict(core.online_forecast_initial_state(),
+        [math.nan] * 8, [math.nan] * 18, 0.0, 30.0)
+    for key, expected_length in (("stock_logit_contributions", 17),
+                                 ("option_logit_contributions", 39),
+                                 ("normalized_option_features", 18),
+                                 ("effective_option_design", 39),
+                                 ("observed_feature_mask", 26)):
+        if key not in receipt or len(receipt[key]) != expected_length:
+            raise RuntimeError(f"v3 attribution contract failed: {key}")
+    if receipt["option_feature_coverage"] != 0 or receipt["probability_up"] != 0.5:
+        raise RuntimeError("missing observations must preserve a neutral cold start")
 
     distances = np.asarray([-0.15, -0.05, 0.05, 0.15], dtype=np.float64)
     expiries = np.asarray([1.0, 7.0, 30.0], dtype=np.float64)

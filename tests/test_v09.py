@@ -15,8 +15,6 @@ from option_wave import (
     MassiveHTTPClient,
     OceanWave,
     OptionWaveV09,
-    ShortData,
-    aggregate_large_flow,
     HAS_CPP_CORE,
 )
 from option_wave._backend import cpp_core
@@ -147,7 +145,9 @@ class OceanWaveTests(unittest.TestCase):
         self.assertGreaterEqual(result.expectations[30.0].probability_up, 0.0)
         self.assertLessEqual(result.expectations[30.0].probability_up, 1.0)
         self.assertEqual(set(result.factor_table.factor), set(FACTOR_NAMES))
-        self.assertAlmostEqual(float(result.factor_table.dynamic_weight.sum()), 1.0)
+        self.assertLessEqual(float(result.factor_table.dynamic_weight.sum()), 1.0)
+        self.assertAlmostEqual(float(result.factor_table.dynamic_weight.sum())
+                               + result.diagnostics["neutral_factor_weight"], 1.0, places=10)
         self.assertEqual(result.diagnostics["model_name"], "Ocean Wave")
 
     @unittest.skipUnless(HAS_CPP_CORE, "compiled extension is not installed")
@@ -168,7 +168,6 @@ class OceanWaveTests(unittest.TestCase):
         with (
             patch("option_wave.elo.HAS_CPP_CORE", False),
             patch("option_wave.factors.HAS_CPP_CORE", False),
-            patch("option_wave.flow.HAS_CPP_CORE", False),
             patch("option_wave.model.HAS_CPP_CORE", False),
         ):
             reference = OceanWave().predict(
@@ -218,44 +217,7 @@ class OceanWaveTests(unittest.TestCase):
         second_signal = second.elo_surface.elo_signal.to_numpy()
         self.assertFalse(np.allclose(first_signal, second_signal))
 
-    def test_large_flow_tracks_direction_without_price_guessing(self) -> None:
-        flow = pd.DataFrame([
-            {
-                "timestamp": "2026-07-18T14:59:00Z",
-                "right": "C",
-                "aggressor": "buy",
-                "contracts": 10_000,
-                "trade_price": 2.0,
-                "is_opening": True,
-                "delta": 0.45,
-                "gamma": 0.02,
-                "spot": 100.0,
-            },
-            {
-                "timestamp": "2026-07-18T14:59:00Z",
-                "right": "P",
-                "aggressor": "buy",
-                "contracts": 5_000,
-                "trade_price": 1.0,
-                "is_opening": True,
-            },
-            {
-                "timestamp": "2026-07-18T14:59:00Z",
-                "right": "C",
-                "contracts": 5_000,
-                "trade_price": 1.0,
-                "is_opening": True,
-            },
-        ])
-        summary = aggregate_large_flow(flow, asof="2026-07-18T15:00:00Z")
-        self.assertEqual(summary.large_trade_count, 1)
-        self.assertGreater(summary.large_net_notional, 0.0)
-        self.assertGreater(summary.large_signal, 0.0)
-        self.assertGreater(summary.confidence, 0.0)
-        self.assertGreater(summary.delta_hedge_shares, 0.0)
-        self.assertGreater(summary.hedge_signal, 0.0)
-
-    def test_short_pressure_enters_model_without_changing_energy_cost(self) -> None:
+    def test_deleted_short_pressure_is_not_a_direction_factor(self) -> None:
         result = OceanWave().predict(
             chain(),
             MarketState(
@@ -266,21 +228,27 @@ class OceanWaveTests(unittest.TestCase):
                 return_15m=-0.015,
                 realized_vol=0.25,
             ),
-            short_data=ShortData(
-                short_interest_ratio=0.25,
-                short_interest_change=0.12,
-                short_volume_ratio=0.65,
-                borrow_fee=0.18,
-                utilization=0.92,
-                days_to_cover=5.0,
-            ),
             horizons_minutes=(30.0,),
         )
-        short_row = result.factor_table.loc[result.factor_table.factor == "short_pressure"].iloc[0]
-        self.assertLess(float(short_row.signal), 0.0)
-        self.assertGreater(float(short_row.confidence), 0.0)
+        self.assertNotIn("short_pressure", set(result.factor_table.factor))
         expected_cost = energy_cost(float(np.median(result.distance_grid)), EloConfig())
         self.assertAlmostEqual(float(result.diagnostics["energy_cost_at_median_distance"]), float(expected_cost))
+
+    def test_retired_flow_and_short_apis_cannot_be_reactivated(self) -> None:
+        import importlib.util
+        import option_wave
+        import option_wave.factors as factors
+
+        self.assertIsNone(importlib.util.find_spec("option_wave.flow"))
+        for name in ("FlowConfig", "FlowSummary", "ShortData", "aggregate_large_flow"):
+            self.assertFalse(hasattr(option_wave, name), name)
+        for name in ("ShortData", "ShortFactor", "short_pressure"):
+            self.assertFalse(hasattr(factors, name), name)
+        for name in ("normalize_short_data", "fetch_option_trades"):
+            self.assertFalse(hasattr(MassiveHTTPClient, name), name)
+        if HAS_CPP_CORE:
+            for name in ("aggregate_flow", "aggregate_flow_risk", "compute_short_factor"):
+                self.assertFalse(hasattr(cpp_core, name), name)
 
     def test_iv_gex_and_oi_statistics_are_extracted(self) -> None:
         current = chain()
@@ -302,19 +270,6 @@ class OceanWaveTests(unittest.TestCase):
         self.assertTrue(np.isfinite(result.chain_factors.gex_net))
         self.assertGreater(result.chain_factors.iv_coverage, 0.0)
 
-    def test_short_json_normalizer_uses_decimal_units(self) -> None:
-        short_data = MassiveHTTPClient.normalize_short_data({
-            "short_percent_float": 22.0,
-            "short_interest_change": 5.0,
-            "short_volume_ratio": 0.61,
-            "cost_to_borrow": 18.0,
-            "utilization": 91.0,
-            "days_to_cover": 4.2,
-        })
-        self.assertAlmostEqual(short_data.short_interest_ratio or 0.0, 0.22)
-        self.assertAlmostEqual(short_data.borrow_fee or 0.0, 0.18)
-        self.assertAlmostEqual(short_data.utilization or 0.0, 0.91)
-
     def test_legacy_class_name_remains_an_alias(self) -> None:
         self.assertIs(OptionWaveV09, OceanWave)
 
@@ -335,26 +290,16 @@ class OceanWaveTests(unittest.TestCase):
         self.assertLess(result.diagnostics["inverse_target_signal"], 0.0)
 
     def test_composite_signal_contains_optional_indicators(self) -> None:
-        flow = pd.DataFrame([
-            {
-                "age_minutes": 1.0,
-                "right": "C",
-                "aggressor": "buy",
-                "contracts": 10_000,
-                "trade_price": 2.0,
-                "is_opening": True,
-            },
-        ])
         result = OptionWaveV09().predict(
             chain(),
             MarketState(spot=100.0, realized_vol=0.25),
-            flow=flow,
             inverse_state=MarketState(spot=100.0, previous_close=99.0, realized_vol=0.25),
             inverse_beta=-1.0,
             horizons_minutes=(30.0,),
         )
         self.assertIn("composite_signal", result.diagnostics)
-        self.assertGreater(result.diagnostics["large_flow_gross_notional"], 0.0)
+        self.assertNotIn("institutional_flow", set(result.factor_table.factor))
+        self.assertNotIn("large_flow_gross_notional", result.diagnostics)
         self.assertNotEqual(result.diagnostics["inverse_target_signal"], 0.0)
 
     def test_inverse_registry_is_universal_and_extensible(self) -> None:

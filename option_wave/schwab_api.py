@@ -51,6 +51,8 @@ def _timestamp(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, (int, float)):
+        if isinstance(value, bool) or not np.isfinite(float(value)) or float(value) <= 0.0:
+            return None
         seconds = float(value) / 1000.0 if float(value) > 1e11 else float(value)
         try:
             return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()

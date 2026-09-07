@@ -30,6 +30,122 @@ inline bool all_finite(const std::vector<double>& values) {
     return std::all_of(values.begin(), values.end(), [](double value) { return std::isfinite(value); });
 }
 
+struct FactorBudgetBlend {
+    std::vector<double> mean;
+    std::vector<double> covariance;
+    std::vector<double> weights;
+    double signal = 0.0;
+    double confidence = 0.0;
+    double projected_variance = 0.0;
+    double count = 0.0;
+    double kkt_residual = 0.0;
+};
+
+// Box-constrained, strictly convex QP. Missing budgets remain neutral; the
+// solver never renormalizes surviving factors. Squared correlations are PSD
+// by the Schur product theorem and penalize redundant evidence of either sign.
+inline FactorBudgetBlend blend_factor_budgets(
+    const std::vector<double>& factors,
+    const std::vector<double>& confidences,
+    const std::vector<double>& budgets,
+    const std::vector<double>& previous_mean,
+    const std::vector<double>& previous_covariance,
+    double observation_count,
+    double alpha,
+    double penalty,
+    double shrinkage
+) {
+    const std::size_t n = factors.size();
+    if (n == 0 || n > 32 || confidences.size() != n || budgets.size() != n
+        || previous_mean.size() != n || previous_covariance.size() != n * n
+        || !all_finite(previous_mean) || !all_finite(previous_covariance)
+        || !all_finite(budgets) || !std::isfinite(observation_count) || observation_count < 0.0
+        || !std::isfinite(alpha) || alpha <= 0.0 || alpha > 1.0
+        || !std::isfinite(penalty) || penalty < 0.0 || penalty >= 1.0
+        || !std::isfinite(shrinkage) || shrinkage < 0.0 || shrinkage > 1.0) {
+        throw std::invalid_argument("invalid factor budget inputs");
+    }
+    double total_budget = 0.0;
+    for (double value : budgets) {
+        if (value < 0.0) throw std::invalid_argument("negative factor budget");
+        total_budget += value;
+    }
+    if (total_budget <= 0.0 || total_budget > 1.0 + EPSILON) {
+        throw std::invalid_argument("factor budgets must sum to at most one");
+    }
+    FactorBudgetBlend out;
+    out.mean = previous_mean;
+    out.covariance = previous_covariance;
+    out.count = observation_count;
+    std::vector<double> clean(n), quality(n), upper(n), innovation(n), decay(n, 1.0);
+    bool observed = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        const bool valid = std::isfinite(factors[i]) && std::isfinite(confidences[i]);
+        clean[i] = valid ? clamp(factors[i], -1.0, 1.0) : 0.0;
+        quality[i] = valid ? clamp(confidences[i], 0.0, 1.0) : 0.0;
+        upper[i] = budgets[i] * quality[i];
+        if (quality[i] <= 0.0) continue;
+        observed = true;
+        innovation[i] = clean[i] - previous_mean[i];
+        decay[i] = std::sqrt(1.0 - alpha);
+        out.mean[i] = observation_count <= 0.0 ? clean[i] : previous_mean[i] + alpha * innovation[i];
+    }
+    if (observed && observation_count > 0.0) {
+        // This PSD-preserving masked EWMA retains uncertainty for absent data.
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) {
+                out.covariance[i * n + j] = previous_covariance[i * n + j] * decay[i] * decay[j]
+                    + alpha * (1.0 - alpha) * innovation[i] * innovation[j];
+            }
+        }
+    }
+    if (observed) out.count += 1.0;
+    std::vector<double> hessian(n * n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < n; ++j) {
+            const double denominator = std::sqrt(std::max(out.covariance[i * n + i], EPSILON)
+                * std::max(out.covariance[j * n + j], EPSILON));
+            const double correlation = i == j ? 1.0 : clamp(out.covariance[i * n + j] / denominator, -1.0, 1.0);
+            const double redundancy = (1.0 - shrinkage) * correlation * correlation + (i == j ? shrinkage : 0.0);
+            // Remove self-correlation shrinkage, retaining positive definiteness
+            // through H=(1-lambda)I+lambda*R, 0<=lambda<1.
+            hessian[i * n + j] = (i == j ? 1.0 - penalty : 0.0) + penalty * redundancy;
+        }
+    }
+    out.weights = upper;
+    for (std::size_t iteration = 0; iteration < 512; ++iteration) {
+        double largest_change = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            double off_diagonal = 0.0;
+            for (std::size_t j = 0; j < n; ++j) {
+                if (i != j) off_diagonal += hessian[i * n + j] * out.weights[j];
+            }
+            const double updated = clamp((upper[i] - off_diagonal) / hessian[i * n + i], 0.0, upper[i]);
+            largest_change = std::max(largest_change, std::abs(updated - out.weights[i]));
+            out.weights[i] = updated;
+        }
+        if (largest_change < 1e-13) break;
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        double gradient = -upper[i];
+        out.signal += out.weights[i] * clean[i];
+        // Observation quality already limits each weight's eligible budget.
+        // Multiplying it again would count the same missingness twice.
+        out.confidence += out.weights[i];
+        for (std::size_t j = 0; j < n; ++j) {
+            gradient += hessian[i * n + j] * out.weights[j];
+            out.projected_variance += out.weights[i] * out.covariance[i * n + j] * out.weights[j];
+        }
+        out.kkt_residual = std::max(out.kkt_residual,
+            std::abs(out.weights[i] - clamp(out.weights[i] - gradient, 0.0, upper[i])));
+    }
+    if (out.kkt_residual > 1e-9) throw std::runtime_error("factor budget QP did not converge");
+    out.signal = clamp(out.signal, -1.0, 1.0);
+    out.confidence = clamp(out.confidence, 0.0, 1.0);
+    out.projected_variance = std::max(out.projected_variance, 0.0);
+    return out;
+}
+
 struct IntradayFourierFeatures {
     std::size_t sample_count = 0;
     std::size_t harmonic_count = 0;
@@ -353,19 +469,22 @@ inline StockConfirmation stock_confirmation(
         weight_sum += weight;
         ++present;
     };
-    if (std::isfinite(previous_close) && previous_close > 0.0 && spot > 0.0) {
+    if (std::isfinite(previous_close) && previous_close > 0.0 && std::isfinite(spot) && spot > 0.0) {
         const double clean_realized_vol = std::isfinite(realized_vol) ? realized_vol : 0.0;
         const double daily_scale = std::max(clean_realized_vol / std::sqrt(252.0), 0.005);
         add(std::log(spot / previous_close) / daily_scale, 0.25);
     }
-    if (std::isfinite(vwap) && vwap > 0.0) add((spot - vwap) / vwap / 0.003, 0.25);
+    if (std::isfinite(vwap) && vwap > 0.0 && std::isfinite(spot) && spot > 0.0) add((spot - vwap) / vwap / 0.003, 0.25);
     if (std::isfinite(return_5m)) add(return_5m / 0.003, 0.25);
     if (std::isfinite(return_15m)) add(return_15m / 0.006, 0.15);
-    if (std::isfinite(rvol) && rvol > 0.0) add(std::log(std::max(rvol, EPSILON)), 0.10);
     if (weight_sum <= EPSILON) return {};
+    // RVOL is unsigned activity: affect confidence, never independent direction.
+    const double volume_quality = std::isfinite(rvol) && rvol > 0.0
+        ? 0.75 + 0.25 * std::tanh(std::log(std::max(rvol, EPSILON))) : 0.75;
+    const double clean_confidence = std::isfinite(data_confidence) ? clamp(data_confidence, 0.0, 1.0) : 0.0;
     return {
         std::tanh(weighted_sum / weight_sum),
-        clamp(static_cast<double>(present) / 5.0 * clamp(data_confidence, 0.0, 1.0), 0.0, 1.0)
+        clamp(static_cast<double>(present) / 4.0 * volume_quality * clean_confidence, 0.0, 1.0)
     };
 }
 
@@ -674,7 +793,7 @@ inline Forecast forecast_surface(
     }
     result.trend_score = std::tanh(result.averages.back());
     result.confidence = clamp(
-        composite_confidence * (0.35 + 0.65 * liquidity_quality) * std::exp(-projected_factor_variance),
+        composite_confidence * std::exp(-projected_factor_variance),
         0.0,
         1.0
     );

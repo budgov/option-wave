@@ -24,6 +24,7 @@ from ._backend import HAS_CPP_CORE
 from .schwab_api import SchwabHTTPClient, SchwabHTTPConfig, latest_quote_timestamp
 from .shadow_calibration import ShadowCalibrator
 from .contract import assess_contract_value
+from .market_context import prepare_market_context
 
 SYMBOL_PATTERN = re.compile(r"[A-Z][A-Z0-9.\-]{0,14}")
 CHAIN_STATE_COLUMNS = (
@@ -486,7 +487,7 @@ def extract_target_contract_quote(
 
     A corrupt Greek elsewhere in the chain must prevent model inference and
     state updates, but it must not erase a valid bid/ask for the exact contract
-    that is needed for timestamped prediction and quote validation.
+    that is needed to audit a source-reported entry or exit.
     """
 
     resolved_expiry = requested_expiry
@@ -857,6 +858,7 @@ class RealtimePredictor:
         strike: float | None = None,
         option_type: str | None = None,
         market_state_overrides: dict[str, Any] | None = None,
+        market_context: dict[str, Any] | None = None,
         checkpoint_async: bool | None = None,
         training_day_valid: bool = True,
         maximum_snapshot_age_seconds: float | None = None,
@@ -938,7 +940,8 @@ class RealtimePredictor:
         if quarantine_reasons:
             quality_diagnostics["accepted"] = False
             quality_diagnostics["reasons"] = quarantine_reasons
-            observed_at = target_quote_observed_at or latest_quote_timestamp(chain) or captured_at
+            # Collection time proves receipt, not a broker quote timestamp.
+            observed_at = target_quote_observed_at or latest_quote_timestamp(chain)
             return json_value({
                 "schema_version": "ocean-wave-snapshot.v2",
                 "provider": "schwab",
@@ -999,8 +1002,11 @@ class RealtimePredictor:
             data_confidence=min(current_data_confidence, effective_chain_quality),
         )
         model_started = perf_counter()
+        prepared_context = prepare_market_context(market_context, symbol=symbol,
+            issued_at=signal_published_at, realized_vol=market_state.realized_vol)
         result = runtime.model.predict(chain, market_state, previous_chain=runtime.previous_chain,
-                                       horizons_minutes=horizons, training_day_valid=training_day_valid)
+                                       horizons_minutes=horizons, training_day_valid=training_day_valid,
+                                       market_context=prepared_context["model"])
         if training_day_valid:
             runtime.previous_chain = compact_previous_chain(chain)
         if training_day_valid and quality_audit.gex_gross > 0.0:
@@ -1018,7 +1024,7 @@ class RealtimePredictor:
         model_ms = (perf_counter() - model_started) * 1000.0
 
         contract_assessment = None
-        observed_at = target_quote_observed_at or latest_quote_timestamp(chain) or captured_at
+        observed_at = target_quote_observed_at or latest_quote_timestamp(chain)
         if target_contract is not None:
             matched = target_contract.get("matched")
             contract_assessment = assess_contract(
@@ -1044,8 +1050,11 @@ class RealtimePredictor:
             "market_state": asdict(market_state), "target_contract": target_contract,
             "contract_assessment": contract_assessment, "events": None, "chain_context": context,
             "chain_quality": quality_diagnostics, "quarantined": False,
+            "market_context": market_context,
+            "market_context_audit": prepared_context["audit"],
+            "context_features": prepared_context["context_features"],
             "ocean_wave": {
-                "model_version": "ocean-wave.stable-pde.v2",
+                "model_version": "ocean-wave.group-budget.v4",
                 "numerical_method": "implicit_finite_volume_signed_score",
                 "native_core": HAS_CPP_CORE, "trend_score": result.trend_score,
                 "direction": result.direction, "confidence": result.confidence,

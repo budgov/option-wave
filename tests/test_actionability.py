@@ -57,10 +57,20 @@ def complete_state() -> MarketState:
 
 class ActionabilityTests(unittest.TestCase):
     def test_weak_probability_is_explicit_abstention_and_keeps_raw_probability(self) -> None:
+        # This test isolates directional-edge gating, not data coverage. Under
+        # bounded budgets, absent inverse/macro data rightly stays neutral and
+        # can fail evidence-quality first. Explicitly observed zero signals
+        # are different from missing signals and supply the complete fixture.
+        macro_names = ("gold", "treasury_10y", "dollar_index", "vix")
         result = OceanWave().predict(
-            symmetric_chain(), complete_state(), horizons_minutes=(30.0,)
+            symmetric_chain(), complete_state(), horizons_minutes=(30.0,),
+            market_context={"inverse_signal": 0.0, "inverse_confidence": 1.0,
+                            "macro_signals": dict.fromkeys(macro_names, 0.0),
+                            "macro_confidences": dict.fromkeys(macro_names, 1.0)},
         )
 
+        self.assertGreaterEqual(result.evidence_quality, 0.25)
+        self.assertGreaterEqual(result.diagnostics["market_data_quality"], 0.50)
         self.assertEqual(result.direction, "Abstain")
         self.assertEqual(result.actionability, "abstain")
         self.assertEqual(result.abstain_reason, "weak_directional_edge")
@@ -69,7 +79,7 @@ class ActionabilityTests(unittest.TestCase):
             abs(result.calibrated_probability - 0.5),
             abs(result.raw_probability - 0.5),
         )
-        self.assertIn("weak_directional_edge", result.diagnostics["abstain_reasons"])
+        self.assertEqual(result.diagnostics["abstain_reasons"], ["weak_directional_edge"])
 
     def test_each_missing_causal_feature_degrades_market_data_quality(self) -> None:
         baseline = OceanWave().predict(

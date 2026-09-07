@@ -416,133 +416,6 @@ py::dict update_elo(
     return result;
 }
 
-py::dict aggregate_flow(
-    const DoubleArray& notional,
-    const DoubleArray& direction,
-    const DoubleArray& confidence,
-    const DoubleArray& age_minutes,
-    const DoubleArray& large_mask,
-    double half_life_minutes
-) {
-    validate_arrays(notional.size(), {&notional, &direction, &confidence, &age_minutes, &large_mask});
-    const auto notional_view = notional.unchecked<1>();
-    const auto direction_view = direction.unchecked<1>();
-    const auto confidence_view = confidence.unchecked<1>();
-    const auto age_view = age_minutes.unchecked<1>();
-    const auto large_view = large_mask.unchecked<1>();
-    const double half_life = std::max(half_life_minutes, 1e-6);
-    const double log_two = std::log(2.0);
-    double net = 0.0;
-    double gross = 0.0;
-    double large_net = 0.0;
-    double large_gross = 0.0;
-    double confidence_mass = 0.0;
-    double recent_net = 0.0;
-    double recent_gross = 0.0;
-    double prior_net = 0.0;
-    double prior_gross = 0.0;
-    double large_count = 0.0;
-    for (Index i = 0; i < notional.size(); ++i) {
-        const double amount = std::max(notional_view(i), 0.0);
-        const double signed_direction = std::max(-1.0, std::min(1.0, direction_view(i)));
-        const double conf = std::max(0.0, std::min(1.0, confidence_view(i)));
-        const double age = std::max(age_view(i), 0.0);
-        const double decay = std::exp(-log_two * age / half_life);
-        const double weighted = amount * conf * decay;
-        const double signed_weighted = weighted * signed_direction;
-        const bool is_large = large_view(i) > 0.0;
-        net += signed_weighted;
-        gross += weighted;
-        confidence_mass += weighted * conf;
-        if (is_large) {
-            large_net += signed_weighted;
-            large_gross += weighted;
-            large_count += 1.0;
-        }
-        if (age <= half_life) {
-            recent_net += signed_weighted;
-            recent_gross += weighted;
-        } else if (age <= 2.0 * half_life) {
-            prior_net += signed_weighted;
-            prior_gross += weighted;
-        }
-    }
-    const double signal = std::tanh(net / std::max(gross, EPS));
-    const double large_signal = std::tanh(large_net / std::max(large_gross, EPS));
-    const double recent_ratio = recent_net / std::max(recent_gross, EPS);
-    const double prior_ratio = prior_net / std::max(prior_gross, EPS);
-    py::dict result;
-    result["net_notional"] = net;
-    result["gross_notional"] = gross;
-    result["large_net_notional"] = large_net;
-    result["large_gross_notional"] = large_gross;
-    result["large_trade_count"] = large_count;
-    result["signal"] = signal;
-    result["large_signal"] = large_signal;
-    result["velocity"] = std::tanh(recent_ratio - prior_ratio);
-    result["confidence"] = confidence_mass / std::max(gross, EPS);
-    return result;
-}
-
-py::dict aggregate_flow_risk(
-    const DoubleArray& notional,
-    const DoubleArray& direction,
-    const DoubleArray& confidence,
-    const DoubleArray& age_minutes,
-    const DoubleArray& large_mask,
-    const DoubleArray& contracts,
-    const DoubleArray& delta,
-    const DoubleArray& gamma,
-    double spot,
-    double half_life_minutes
-) {
-    const Index size = notional.size();
-    validate_arrays(size, {
-        &notional, &direction, &confidence, &age_minutes, &large_mask, &contracts, &delta, &gamma
-    });
-    py::dict result = aggregate_flow(notional, direction, confidence, age_minutes, large_mask, half_life_minutes);
-    const auto direction_view = direction.unchecked<1>();
-    const auto confidence_view = confidence.unchecked<1>();
-    const auto age_view = age_minutes.unchecked<1>();
-    const auto contracts_view = contracts.unchecked<1>();
-    const auto delta_view = delta.unchecked<1>();
-    const auto gamma_view = gamma.unchecked<1>();
-    const double half_life = std::max(half_life_minutes, 1e-6);
-    const double log_two = std::log(2.0);
-    double delta_net = 0.0;
-    double delta_gross = 0.0;
-    double gamma_net = 0.0;
-    double gamma_gross = 0.0;
-    double greek_coverage = 0.0;
-    for (Index i = 0; i < size; ++i) {
-        const double contracts_value = std::max(contracts_view(i), 0.0);
-        const double signed_direction = clamp_value(direction_view(i), -1.0, 1.0);
-        const double conf = clamp_value(confidence_view(i), 0.0, 1.0);
-        const double decay = std::exp(-log_two * std::max(age_view(i), 0.0) / half_life);
-        const double weight = conf * decay;
-        if (std::isfinite(delta_view(i))) {
-            const double exposure = contracts_value * 100.0 * std::abs(delta_view(i)) * weight;
-            delta_net += exposure * signed_direction;
-            delta_gross += exposure;
-            greek_coverage += weight;
-        }
-        if (std::isfinite(gamma_view(i)) && spot > 0.0) {
-            const double exposure = contracts_value * 100.0 * std::abs(gamma_view(i)) * spot * spot * weight;
-            gamma_net += exposure * signed_direction;
-            gamma_gross += exposure;
-        }
-    }
-    const double delta_ratio = delta_net / std::max(delta_gross, EPS);
-    const double gamma_ratio = gamma_net / std::max(gamma_gross, EPS);
-    result["delta_hedge_shares"] = delta_net;
-    result["delta_hedge_gross_shares"] = delta_gross;
-    result["gamma_notional"] = gamma_net;
-    result["gamma_gross_notional"] = gamma_gross;
-    result["hedge_signal"] = std::tanh(0.75 * delta_ratio + 0.25 * gamma_ratio);
-    result["greek_coverage"] = size > 0 ? clamp_value(greek_coverage / static_cast<double>(size), 0.0, 1.0) : 0.0;
-    return result;
-}
-
 py::dict extract_chain_factors(
     const DoubleArray& strikes,
     const DoubleArray& expiries,
@@ -621,6 +494,10 @@ py::dict extract_chain_factors(
     double quote_quality_sum = 0.0;
     double quote_quality_weight = 0.0;
     double total_volume = 0.0;
+    double delta_activity = 0.0;
+    double activity_coverage = 0.0;
+    double quote_coverage = 0.0;
+    std::map<double, double> gamma_by_strike;
     double oi_change_coverage = 0.0;
     double iv_coverage = 0.0;
     double gamma_coverage = 0.0;
@@ -630,7 +507,7 @@ py::dict extract_chain_factors(
     std::vector<double> normal_rhs(4, 0.0);
 
     auto quote_quality = [](double bid, double ask, double price) {
-        if (!std::isfinite(bid) || !std::isfinite(ask) || ask < bid || ask <= 0.0) return 0.0;
+        if (!std::isfinite(bid) || !std::isfinite(ask) || bid < 0.0 || ask < bid || ask <= 0.0) return 0.0;
         const double mid = std::max(0.5 * (bid + ask), std::max(price, EPS));
         const double relative_spread = std::max(ask - bid, 0.0) / mid;
         return std::exp(-4.0 * relative_spread);
@@ -661,6 +538,11 @@ py::dict extract_chain_factors(
         const double call_oi_value = std::max(std::isfinite(coi(i)) ? coi(i) : 0.0, 0.0);
         const double put_oi_value = std::max(std::isfinite(poi(i)) ? poi(i) : 0.0, 0.0);
         total_volume += call_volume_value + put_volume_value;
+        const bool call_activity_valid = std::isfinite(cv(i)) && std::isfinite(cd(i));
+        const bool put_activity_valid = std::isfinite(pv(i)) && std::isfinite(pd(i));
+        delta_activity += (call_activity_valid ? call_volume_value * std::abs(cd(i)) : 0.0)
+            + (put_activity_valid ? put_volume_value * std::abs(pd(i)) : 0.0);
+        if (call_activity_valid || put_activity_valid) activity_coverage += 1.0;
 
         const double call_delta_value = std::isfinite(cd(i)) ? std::abs(cd(i)) : 0.5;
         const double put_delta_value = std::isfinite(pd(i)) ? std::abs(pd(i)) : 0.5;
@@ -678,6 +560,7 @@ py::dict extract_chain_factors(
             const double put_gex = put_oi_value * std::max(std::isfinite(pg(i)) ? std::abs(pg(i)) : 0.0, 0.0) * 100.0 * spot * spot * base_weight;
             net_gex += call_gex - put_gex;
             gross_gex += call_gex + put_gex;
+            gamma_by_strike[strike(i)] += call_gex + put_gex;
             gamma_coverage += 1.0;
         }
         if (std::isfinite(cd(i)) || std::isfinite(pd(i))) delta_coverage += 1.0;
@@ -685,6 +568,10 @@ py::dict extract_chain_factors(
 
         const double call_quality = quote_quality(cb(i), ca(i), call_price_value);
         const double put_quality = quote_quality(pb(i), pa(i), put_price_value);
+        const auto valid_quote = [](double bid, double ask) {
+            return std::isfinite(bid) && std::isfinite(ask) && bid >= 0.0 && ask >= bid && ask > 0.0;
+        };
+        if (valid_quote(cb(i), ca(i)) || valid_quote(pb(i), pa(i))) quote_coverage += 1.0;
         const double activity_weight = 1.0 + std::log1p(call_volume_value + put_volume_value);
         quote_quality_sum += 0.5 * (call_quality + put_quality) * activity_weight;
         quote_quality_weight += activity_weight;
@@ -717,6 +604,13 @@ py::dict extract_chain_factors(
         }
     }
 
+    std::vector<double> curvature_matrix(9), curvature_rhs(3), curvature_fit;
+    for (int row = 0; row < 3; ++row) {
+        curvature_rhs[row] = normal_rhs[row];
+        for (int col = 0; col < 3; ++col) curvature_matrix[row * 3 + col] = normal_matrix[row * 4 + col];
+    }
+    const bool curvature_identified = iv_coverage >= 4.0
+        && solve_linear_system(curvature_matrix, curvature_rhs, 3, curvature_fit);
     for (int diagonal = 0; diagonal < 4; ++diagonal) normal_matrix[diagonal * 4 + diagonal] += 1e-8;
     std::vector<double> coefficients(4, 0.0);
     solve_linear_system(normal_matrix, normal_rhs, 4, coefficients);
@@ -771,141 +665,59 @@ py::dict extract_chain_factors(
     result["gex_confidence"] = clamp_value(0.6 * gamma_coverage / row_count, 0.0, 0.6);
     result["liquidity_quality"] = liquidity_quality;
     result["iv_coverage"] = clamp_value(iv_coverage / row_count, 0.0, 1.0);
+    result["iv_skew_coverage"] = has_two_sided_iv ? 1.0 : 0.0;
+    result["iv_term_coverage"] = near_iv_weight > EPS && far_iv_weight > EPS ? 1.0 : 0.0;
+    result["iv_fit_coverage"] = curvature_identified ? 1.0 : 0.0;
+    result["quote_coverage"] = clamp_value(quote_coverage / row_count, 0.0, 1.0);
+    result["option_activity"] = std::log1p(delta_activity);
+    result["option_activity_coverage"] = clamp_value(activity_coverage / row_count, 0.0, 1.0);
+    double peak_gamma = 0.0;
+    for (const auto& item : gamma_by_strike) peak_gamma = std::max(peak_gamma, item.second);
+    result["gamma_concentration"] = gross_gex > EPS ? peak_gamma / gross_gex : 0.0;
     result["gamma_coverage"] = clamp_value(gamma_coverage / row_count, 0.0, 1.0);
     result["delta_coverage"] = clamp_value(delta_coverage / row_count, 0.0, 1.0);
     result["vega_coverage"] = clamp_value(vega_coverage / row_count, 0.0, 1.0);
     return result;
 }
 
-py::dict compute_short_factor(
-    double short_interest_ratio,
-    double short_interest_change,
-    double short_volume_ratio,
-    double borrow_fee,
-    double utilization,
-    double days_to_cover,
-    double stock_signal,
-    double data_confidence
-) {
-    const double values[6] = {short_interest_ratio, short_interest_change, short_volume_ratio, borrow_fee, utilization, days_to_cover};
-    const double importance[6] = {0.15, 0.25, 0.20, 0.15, 0.15, 0.10};
-    double pressure = 0.0;
-    double weight_sum = 0.0;
-    int present = 0;
-    for (int i = 0; i < 6; ++i) {
-        if (!std::isfinite(values[i])) continue;
-        double feature = 0.0;
-        if (i == 0) feature = std::tanh((values[i] - 0.10) / 0.15);
-        else if (i == 1) feature = std::tanh(values[i] / 0.10);
-        else if (i == 2) feature = std::tanh((values[i] - 0.50) / 0.20);
-        else if (i == 3) feature = std::tanh(std::log1p(std::max(values[i], 0.0)) / 0.10);
-        else if (i == 4) feature = std::tanh((values[i] - 0.50) / 0.25);
-        else feature = std::tanh((values[i] - 2.0) / 3.0);
-        pressure += importance[i] * feature;
-        weight_sum += importance[i];
-        present += 1;
-    }
-    pressure = weight_sum > EPS ? clamp_value(pressure / weight_sum, -1.0, 1.0) : 0.0;
-    const double squeeze = 1.60 * std::max(pressure, 0.0) * std::max(stock_signal, 0.0);
-    const double signal = clamp_value(-pressure + squeeze, -1.0, 1.0);
-    py::dict result;
-    result["signal"] = signal;
-    result["pressure"] = pressure;
-    result["squeeze"] = squeeze;
-    result["confidence"] = clamp_value(data_confidence, 0.0, 1.0) * static_cast<double>(present) / 6.0;
-    return result;
-}
-
-py::dict blend_factors(
+py::dict blend_factor_budgets(
     const DoubleArray& factors,
     const DoubleArray& confidences,
-    const DoubleArray& priors,
+    const DoubleArray& budgets,
     const DoubleArray& previous_mean,
     const DoubleArray& previous_covariance,
     double observation_count,
     double ewma_alpha,
-    double ridge
+    double penalty,
+    double shrinkage
 ) {
     const Index dimension = factors.size();
-    validate_arrays(dimension, {&factors, &confidences, &priors, &previous_mean});
-    const Index covariance_size = checked_product(dimension, dimension);
-    if (previous_covariance.ndim() != 1 || previous_covariance.size() != covariance_size) {
-        throw std::runtime_error("factor arrays have incompatible shapes");
-    }
-    const auto factor_view = factors.unchecked<1>();
-    const auto confidence_view = confidences.unchecked<1>();
-    const auto prior_view = priors.unchecked<1>();
-    const auto mean_view = previous_mean.unchecked<1>();
-    const auto covariance_view = previous_covariance.unchecked<1>();
-    const double alpha = clamp_value(ewma_alpha, 1e-4, 1.0);
-    std::vector<double> clean_factors(dimension), clean_confidence(dimension), mean(dimension), covariance(covariance_size);
-    for (Index i = 0; i < dimension; ++i) {
-        clean_confidence[i] = std::isfinite(confidence_view(i)) ? clamp_value(confidence_view(i), 0.0, 1.0) : 0.0;
-        clean_factors[i] = std::isfinite(factor_view(i)) ? clamp_value(factor_view(i), -1.0, 1.0) : mean_view(i);
-        mean[i] = std::isfinite(mean_view(i)) ? mean_view(i) : 0.0;
-    }
-    for (Index i = 0; i < covariance_size; ++i) {
-        covariance[i] = std::isfinite(covariance_view(i)) ? covariance_view(i) : 0.0;
-    }
-    if (observation_count <= 0.0) {
-        for (Index i = 0; i < dimension; ++i) {
-            if (clean_confidence[i] > 0.0) mean[i] = clean_factors[i];
-        }
-    } else {
-        std::vector<double> old_mean = mean;
-        for (Index i = 0; i < dimension; ++i) {
-            if (clean_confidence[i] > 0.0) mean[i] = (1.0 - alpha) * mean[i] + alpha * clean_factors[i];
-        }
-        for (Index row = 0; row < dimension; ++row) {
-            for (Index col = 0; col < dimension; ++col) {
-                const double innovation_row = clean_confidence[row] > 0.0 ? clean_factors[row] - old_mean[row] : 0.0;
-                const double innovation_col = clean_confidence[col] > 0.0 ? clean_factors[col] - mean[col] : 0.0;
-                covariance[row * dimension + col] = (1.0 - alpha) * covariance[row * dimension + col]
-                    + alpha * innovation_row * innovation_col;
-            }
-        }
-    }
-
-    std::vector<double> system = covariance;
-    std::vector<double> rhs(dimension, 0.0);
-    for (Index i = 0; i < dimension; ++i) {
-        system[i * dimension + i] += std::max(ridge, 1e-8);
-        rhs[i] = std::max(std::isfinite(prior_view(i)) ? prior_view(i) : 0.0, 0.0) * clean_confidence[i];
-    }
-    std::vector<double> weights;
-    if (!solve_linear_system(system, rhs, static_cast<int>(dimension), weights)) weights = rhs;
-    double weight_sum = 0.0;
-    for (Index i = 0; i < dimension; ++i) {
-        weights[i] = std::isfinite(weights[i]) ? std::max(weights[i], 0.0) : 0.0;
-        weight_sum += weights[i];
-    }
-    if (weight_sum <= EPS) {
-        weights = rhs;
-        weight_sum = std::accumulate(weights.begin(), weights.end(), 0.0);
-    }
-    if (weight_sum <= EPS) {
-        weights.assign(dimension, 1.0 / static_cast<double>(dimension));
-    } else {
-        for (double& weight : weights) weight /= weight_sum;
-    }
-    double signal = 0.0;
-    double confidence_value = 0.0;
-    double projected_variance = 0.0;
-    for (Index i = 0; i < dimension; ++i) {
-        signal += weights[i] * clean_factors[i];
-        confidence_value += weights[i] * clean_confidence[i];
-        for (Index j = 0; j < dimension; ++j) {
-            projected_variance += weights[i] * covariance[i * dimension + j] * weights[j];
-        }
+    if (dimension <= 0 || dimension > 32) throw std::invalid_argument("factor dimension must be 1..32");
+    validate_arrays(dimension, {&factors, &confidences, &budgets, &previous_mean});
+    validate_arrays(dimension * dimension, {&previous_covariance});
+    const auto copy = [](const DoubleArray& value) {
+        return std::vector<double>(value.data(), value.data() + value.size());
+    };
+    const auto factor_values = copy(factors);
+    const auto quality_values = copy(confidences);
+    const auto budget_values = copy(budgets);
+    const auto mean_values = copy(previous_mean);
+    const auto covariance_values = copy(previous_covariance);
+    ocean_wave::FactorBudgetBlend blended;
+    {
+        py::gil_scoped_release release;
+        blended = ocean_wave::blend_factor_budgets(factor_values, quality_values, budget_values,
+            mean_values, covariance_values, observation_count, ewma_alpha, penalty, shrinkage);
     }
     py::dict result;
-    result["mean"] = to_array(mean);
-    result["covariance"] = to_array(covariance);
-    result["weights"] = to_array(weights);
-    result["signal"] = clamp_value(signal, -1.0, 1.0);
-    result["confidence"] = clamp_value(confidence_value, 0.0, 1.0);
-    result["projected_variance"] = std::max(projected_variance, 0.0);
-    result["count"] = observation_count + 1.0;
+    result["mean"] = to_array(blended.mean);
+    result["covariance"] = to_array(blended.covariance);
+    result["weights"] = to_array(blended.weights);
+    result["signal"] = blended.signal;
+    result["confidence"] = blended.confidence;
+    result["projected_variance"] = blended.projected_variance;
+    result["count"] = blended.count;
+    result["kkt_residual"] = blended.kkt_residual;
     return result;
 }
 
@@ -1178,6 +990,16 @@ py::dict online_forecast_predict(const std::vector<double>& packed_state,
     result["interval_multiplier"] = prediction.interval_multiplier;
     result["trained_samples"] = prediction.trained_samples;
     result["option_quality"] = prediction.quality;
+    result["context_quality"] = prediction.context_quality;
+    result["option_feature_coverage"] = prediction.option_feature_coverage;
+    result["stock_logit"] = prediction.stock_logit;
+    result["option_logit_increment"] = prediction.option_logit_increment;
+    result["context_logit_increment"] = prediction.context_logit_increment;
+    result["stock_logit_contributions"] = prediction.stock_logit_contributions;
+    result["option_logit_contributions"] = prediction.option_logit_contributions;
+    result["normalized_option_features"] = prediction.option_z;
+    result["effective_option_design"] = prediction.residual;
+    result["observed_feature_mask"] = prediction.seen;
     result["change_score"] = prediction.change_score;
     return result;
 }
@@ -1226,7 +1048,7 @@ py::dict option_profit_probability(double spot, double mean_return, double retur
 
 PYBIND11_MODULE(_core, module) {
     module.doc() = "C++ numerical core for the Ocean Wave model";
-    module.attr("ONLINE_FORECAST_VERSION") = "online_forecast.v1";
+    module.attr("ONLINE_FORECAST_VERSION") = "online_forecast.v3";
     module.attr("ONLINE_FORECAST_STATE_SIZE") = ocean_wave::online::State::SIZE;
     module.attr("ONLINE_FORECAST_FROZEN_SIZE") = ocean_wave::online::Prediction::SIZE;
     module.def("online_forecast_initial_state", [] { return ocean_wave::online::State{}.pack(); });
@@ -1249,11 +1071,8 @@ PYBIND11_MODULE(_core, module) {
     module.attr("FOURIER_BAND_COUNT") = ocean_wave::FOURIER_BAND_COUNT;
     module.def("build_pairs", &build_pairs);
     module.def("update_elo", &update_elo);
-    module.def("aggregate_flow", &aggregate_flow);
-    module.def("aggregate_flow_risk", &aggregate_flow_risk);
     module.def("extract_chain_factors", &extract_chain_factors);
-    module.def("compute_short_factor", &compute_short_factor);
-    module.def("blend_factors", &blend_factors);
+    module.def("blend_factor_budgets", &blend_factor_budgets);
     module.def("evolve_field", &evolve_field);
     module.def("aggregate_surface_signals", &aggregate_surface_signals);
     module.def("compute_stock_confirmation", &compute_stock_confirmation);

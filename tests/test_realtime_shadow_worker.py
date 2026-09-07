@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import unittest
 
-from option_wave.online_forecast import HAS_ONLINE_CORE
+from option_wave.online_forecast import HAS_ONLINE_CORE, OPTION_FEATURES, VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +84,40 @@ def offline_worker():
 
 @unittest.skipUnless(HAS_ONLINE_CORE, "upgraded C++ shadow core is not installed")
 class RealtimeShadowWorkerTests(unittest.TestCase):
+    def test_v3_measured_option_structure_and_old_state_rejection(self):
+        values = (.4, .9, .03, .3, .02, .1, .04, -.2, .3, .8, 9.)
+        option_features = dict(zip(OPTION_FEATURES, values))
+        with offline_worker() as worker:
+            receipt = worker.request("shadow_forecast", symbol="AAPL", horizon=30,
+                stock_features={"return_5m": .002}, option_features=option_features,
+                quality=.8, origin_price=200., forecast_id="structure-v3", issued_at=1_788_800_000.)
+            self.assertEqual(receipt["model_version"], VERSION)
+            self.assertEqual(receipt["feature_version"], 3)
+            self.assertEqual(receipt["option_features"], option_features)
+            self.assertEqual(receipt["option_feature_coverage"], 1.)
+            self.assertEqual(receipt["option_quality"], .8)
+            self.assertIn("option.premium_elo_signal", receipt["feature_attributions"]["option_and_context"])
+            checkpoint = worker.request("shadow_export")
+            self.assertEqual(checkpoint["models"], {})
+            with self.assertRaisesRegex(AssertionError, "incompatible model version"):
+                worker.request("shadow_forecast", state={"model_version": "online_forecast.v2", "shadow_only": True, "models": {}},
+                    symbol="AAPL", horizon=30, stock_features=None, option_features=None,
+                    quality=0., origin_price=200., forecast_id="old-state-v2", issued_at=1_788_800_000.)
+            self.assertEqual(worker.request("shadow_export"), checkpoint)
+            worker.request("shutdown")
+            self.assertEqual(worker.process.wait(timeout=5), 0)
+
+    def test_raw_context_is_revalidated_before_shadow_learning_features(self):
+        with offline_worker() as worker:
+            receipt = worker.request("shadow_forecast", symbol="QQQ", horizon=30,
+                stock_features={"return_5m": 0.002}, option_features={}, quality=0.7, origin_price=200.0,
+                forecast_id="invalid-context", issued_at="2026-09-08T14:00:00Z",
+                market_context={"schema_version": "wrong-version", "instruments": {}},
+                context_features={"gold_return_5m": 0.99, "vix_level": 80})
+            self.assertTrue(all(value is None for value in receipt["context_features"].values()))
+            worker.request("shutdown")
+            self.assertEqual(worker.process.wait(timeout=5), 0)
+
     def test_real_worker_predict_replay_checkpoint_restore_and_shutdown(self):
         issued = 1_788_800_000.0
         with offline_worker() as worker:

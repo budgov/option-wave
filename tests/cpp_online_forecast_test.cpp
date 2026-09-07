@@ -20,7 +20,9 @@ int main() {
     using namespace ocean_wave::online;
     const double missing = std::numeric_limits<double>::quiet_NaN();
     const std::vector<double> stock{0.004, 0.008, 0.003, 1.5, 0.002, missing, 0.35, 0.01};
-    const std::vector<double> options{0.05, 0.30, 0.2, -0.1, missing};
+    const std::vector<double> options{
+        0.3, 0.9, 0.05, 0.30, 0.02, 0.1, 0.03, 0.2, 0.4, 0.8, 9.0,
+        -0.001, missing, 0.002, 1.0, 0.001, -0.2, 20.0};
     State state;
     require(state.pack().size() == State::SIZE, "native state size");
     require(State::unpack(state.pack()).pack() == state.pack(), "empty state roundtrip");
@@ -28,8 +30,12 @@ int main() {
     require(first.pack().size() == Prediction::SIZE, "native receipt size");
     require(Prediction::unpack(first.pack()).pack() == first.pack(), "receipt roundtrip");
     require(first.probability == 0.5, "untrained prior must be neutral");
-    require(first.seen[5] == 0.0 && first.seen[12] == 0.0, "missing masks must survive");
-    require(first.raw[12] == 0.0 && first.residual[4] == 0.0, "missing flow cannot fabricate a signal");
+    constexpr std::size_t missing_inverse = STOCK_COUNT + OPTION_ONLY_COUNT + 1;
+    require(first.seen[5] == 0.0 && first.seen[missing_inverse] == 0.0, "missing masks must survive");
+    require(first.raw[missing_inverse] == 0.0 && first.residual[OPTION_ONLY_COUNT + 1] == 0.0,
+        "missing inverse reference cannot fabricate a signal");
+    require(first.option_feature_coverage == 1.0 && first.quality == 0.8,
+        "quality and measured-feature coverage are separate");
     const auto packed_before = state.pack();
     for (int index = 0; index < 10; ++index) predict(state, stock, options, 0.8, 30.0);
     require(state.pack() == packed_before, "prediction must not update any normalizer or learner");
@@ -47,12 +53,29 @@ int main() {
     require(State::unpack(state.pack()).pack() == state.pack(), "trained state roundtrip");
     double weight_sum = 0.0;
     for (const double weight : fitted.weights) {
-        require(weight >= 0.1 && weight <= 0.7, "Hedge expert floor and concentration bound");
+        require(std::isfinite(weight) && weight > 0.0 && weight < 1.0, "bounded Hedge has no fixed expert floor");
         weight_sum += weight;
     }
     require(std::abs(weight_sum - 1.0) < 1e-12, "Hedge weights must sum to one");
-    const auto no_options = predict(state, stock, std::vector<double>(5, missing), 1.0, 30.0);
+    const auto no_options = predict(state, stock, std::vector<double>(OPTION_COUNT, missing), 1.0, 30.0);
     require(no_options.probabilities[0] == no_options.probabilities[1], "missing options cannot alter stock odds");
+    require(no_options.probabilities[0] == no_options.probabilities[2], "missing context cannot alter stock odds");
+    require(state.count[STOCK_COUNT + OPTION_ONLY_COUNT] > 0.0, "context normalizers learn mature observations");
+    std::vector<double> elo_only(OPTION_COUNT, missing);
+    elo_only[0] = 0.7;
+    elo_only[1] = 1.0;
+    const auto elo_sparse = predict(state, stock, elo_only, 0.8, 30.0);
+    require(elo_sparse.quality == 0.8, "missing optional columns must not dilute ELO quality");
+    require(std::abs(elo_sparse.option_feature_coverage - 2.0 / OPTION_ONLY_COUNT) < 1e-12,
+        "sparse option coverage denominator follows the measured schema");
+    require(elo_sparse.residual[2 * OPTION_COUNT] == 0.0
+        && elo_sparse.residual[2 * OPTION_COUNT + 1] == 0.0
+        && elo_sparse.residual[2 * OPTION_COUNT + 2] == 0.0,
+        "interactions with missing parents must be absent");
+    elo_only[1] = missing;
+    const auto elo_unverified = predict(state, stock, elo_only, 0.8, 30.0);
+    require(elo_unverified.seen[STOCK_COUNT] == 0.0,
+        "missing ELO confidence cannot become synthetic reliability");
     const auto untrusted = predict(state, stock, options, 0.0, 30.0);
     require(untrusted.probabilities[0] == untrusted.probabilities[1], "zero-quality options cannot alter stock odds");
     const auto frozen = first.pack();
@@ -78,6 +101,8 @@ int main() {
         0.5, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0);
     require(deterministic.probability_profit == 0.0, "zero net pnl is not a profit");
     require_throws([&] { predict(state, {}, options, 0.5, 30.0); }, "wrong dimensions must fail");
+    require_throws([&] { predict(state, stock, std::vector<double>(10, missing), 0.5, 30.0); },
+        "the old v2 option/context vector must be rejected");
     require_throws([&] { predict(state, stock, options, 1.5, 30.0); }, "quality outside bounds must fail");
     require_throws([&] { learn(State{}, fitted, 0.1); }, "future trained receipt must fail");
     const auto rebuilt = learn_replay(State{}, fitted, -0.01, 30.0);

@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from datetime import date
 import json
 import os
-import re
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request
@@ -25,7 +24,6 @@ import numpy as np
 import pandas as pd
 
 from .inverse import InverseMarketData, InverseRegistry
-from .factors import ShortData
 from .model import MarketState
 from .http_security import HTTPURLPolicyError, build_https_opener, resolve_https_url
 
@@ -112,11 +110,10 @@ def _append_query(url: str, params: Mapping[str, Any]) -> str:
 
 
 class MassiveHTTPClient:
-    """Small REST client for option snapshots, quotes, and trades.
+    """Small REST client for normalized option snapshots and underlying quotes.
 
-    The class deliberately returns the project's normalized wide chain and
-    long-form flow tables.  The same interface can be implemented for another
-    HTTP provider without changing the C++ numerical core.
+    The same interface can be implemented for another HTTPS provider without
+    changing the C++ numerical core. Retired short/flow APIs are not exposed.
     """
 
     def __init__(
@@ -149,7 +146,7 @@ class MassiveHTTPClient:
             if not isinstance(payload, Mapping):
                 raise HTTPAPIError("transport returned a non-object JSON payload")
             return payload
-        request = Request(url, headers={"Accept": "application/json", "User-Agent": "ocean-wave/1.1"})
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "ocean-wave/1.2"})
         try:
             with self._opener.open(request, timeout=max(float(self.config.timeout_seconds), 0.1)) as response:
                 status = getattr(response, "status", 200)
@@ -252,36 +249,6 @@ class MassiveHTTPClient:
         normalized = frame.groupby(["strike", "expiry_days"], as_index=False, sort=True)[value_columns].agg(first_valid)
         return normalized
 
-    @staticmethod
-    def normalize_short_data(payload: Mapping[str, Any], *, confidence: float = 1.0) -> ShortData:
-        """Normalize a provider's short-interest/borrow JSON object.
-
-        This is intentionally endpoint-neutral because short interest, daily
-        short volume, and securities-lending data often come from different
-        HTTPS vendors. Percent-like values above one are converted to decimal
-        units when they are at most 100.
-        """
-
-        result = payload.get("results") if isinstance(payload.get("results"), Mapping) else payload
-
-        def decimal(*names: str) -> float | None:
-            value = _float(_first(result, *names))
-            if not np.isfinite(value):
-                return None
-            return value / 100.0 if 1.0 < abs(value) <= 100.0 else value
-
-        days = _float(_first(result, "days_to_cover", "short_ratio"))
-        return ShortData(
-            short_interest_ratio=decimal("short_interest_ratio", "short_percent_float", "short_float"),
-            short_interest_change=decimal("short_interest_change", "short_change", "short_interest_delta"),
-            short_volume_ratio=decimal("short_volume_ratio", "short_volume_percent", "short_volume_pct"),
-            borrow_fee=decimal("borrow_fee", "cost_to_borrow", "borrow_rate"),
-            utilization=decimal("utilization", "borrow_utilization"),
-            days_to_cover=days if np.isfinite(days) else None,
-            confidence=float(np.clip(confidence, 0.0, 1.0)),
-            as_of=_first(result, "as_of", "date", "timestamp"),
-        )
-
     def fetch_option_chain(
         self,
         symbol: str,
@@ -314,32 +281,6 @@ class MassiveHTTPClient:
             symbol=symbol.upper(),
             previous_close=previous_close if np.isfinite(previous_close) else None,
         )
-
-    def fetch_option_trades(self, options_ticker: str, *, limit: int | None = None) -> pd.DataFrame:
-        """Fetch raw contract trades for flow classification.
-
-        The trades endpoint does not establish aggressor direction by itself.
-        Join these rows with quotes (or use a provider that supplies an
-        observed side) before passing them to ``aggregate_large_flow``.
-        """
-
-        records = self._paged_results(
-            f"/v3/trades/{options_ticker}",
-            {"limit": limit or self.config.page_limit, "sort": "timestamp", "order": "desc"},
-        )
-        right_match = re.search(r"([CP])\d{8}\d{8}$", options_ticker.upper())
-        right = right_match.group(1) if right_match else None
-        rows = []
-        for item in records:
-            timestamp = _timestamp(_first(item, "sip_timestamp", "participant_timestamp", "timestamp"))
-            rows.append({
-                "timestamp": timestamp,
-                "right": right,
-                "contracts": _float(_first(item, "size", "contracts", "quantity"), 0.0),
-                "trade_price": _float(_first(item, "price", "p"), 0.0),
-                "options_ticker": options_ticker,
-            })
-        return pd.DataFrame(rows, columns=["timestamp", "right", "contracts", "trade_price", "options_ticker"])
 
     def fetch_market_bundle(
         self,

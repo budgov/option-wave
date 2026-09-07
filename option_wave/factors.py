@@ -1,8 +1,8 @@
 """Financial-engineering factor layer for Ocean Wave.
 
-The Python boundary only normalizes tabular inputs.  Chain aggregation,
-short-pressure nonlinearity, and covariance-aware matrix weighting are routed
-to the C++ extension whenever it is present.
+The Python boundary normalizes tabular inputs. Chain diagnostics, stock
+confirmation and bounded correlation-budget weighting use C++ numerical kernels
+with an independent Python reference for regression checks.
 """
 
 from __future__ import annotations
@@ -19,47 +19,22 @@ EPS = 1e-12
 
 FACTOR_NAMES: tuple[str, ...] = (
     "premium_elo",
-    "institutional_flow",
-    "dealer_hedge",
     "iv_surface",
-    "short_pressure",
-    "oi_positioning",
     "stock_confirmation",
     "inverse_confirmation",
-    "liquidity_energy",
+    "gold",
+    "treasury_10y",
+    "dollar_index",
+    "vix",
 )
 
-# These are structural priors, not permanent output weights.  The online
-# covariance matrix and each observation's confidence reallocate them.
+# Equal information-family budgets are a maximum-entropy cold-start policy,
+# not fitted predictive skill. Option structure splits its quarter between
+# premium ELO and IV; macro context splits its quarter across four markets.
+# Missing or redundant evidence leaves a neutral reserve, never donated ELO.
 DEFAULT_FACTOR_PRIORS: tuple[float, ...] = (
-    0.22,
-    0.16,
-    0.14,
-    0.12,
-    0.10,
-    0.09,
-    0.08,
-    0.05,
-    0.04,
+    0.125, 0.125, 0.25, 0.25, 0.0625, 0.0625, 0.0625, 0.0625,
 )
-
-
-@dataclass(frozen=True)
-class ShortData:
-    """Normalized short-market observation.
-
-    Ratios and fees use decimal units: 18% is ``0.18``.  Missing fields should
-    remain ``None``; they are not imputed or guessed.
-    """
-
-    short_interest_ratio: float | None = None
-    short_interest_change: float | None = None
-    short_volume_ratio: float | None = None
-    borrow_fee: float | None = None
-    utilization: float | None = None
-    days_to_cover: float | None = None
-    confidence: float = 1.0
-    as_of: pd.Timestamp | str | None = None
 
 
 @dataclass
@@ -67,7 +42,8 @@ class FactorConfig:
     names: tuple[str, ...] = FACTOR_NAMES
     priors: tuple[float, ...] = DEFAULT_FACTOR_PRIORS
     ewma_alpha: float = 0.08
-    covariance_ridge: float = 0.05
+    correlation_penalty: float = 0.25
+    covariance_shrinkage: float = 0.25
     initial_variance: float = 0.25
     minimum_confidence: float = 0.02
 
@@ -77,9 +53,20 @@ class FactorConfig:
         if len(set(self.names)) != len(self.names):
             raise ValueError("factor names must be unique")
         priors = np.asarray(self.priors, dtype=float)
-        if np.any(~np.isfinite(priors)) or np.any(priors < 0.0) or priors.sum() <= 0.0:
-            raise ValueError("factor priors must be finite, non-negative, and non-zero")
-        self.priors = tuple((priors / priors.sum()).tolist())
+        if (np.any(~np.isfinite(priors)) or np.any(priors < 0.0)
+                or not 0.0 < priors.sum() <= 1.0 + EPS):
+            raise ValueError("factor budgets must be finite, non-negative, and sum to at most one")
+        if len(self.names) > 32:
+            raise ValueError("at most 32 factor budgets are supported")
+        for name in ("ewma_alpha", "covariance_shrinkage", "minimum_confidence"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between zero and one")
+        if self.ewma_alpha <= 0.0 or not np.isfinite(self.initial_variance) or self.initial_variance <= 0.0:
+            raise ValueError("positive EWMA alpha and initial variance are required")
+        if not np.isfinite(self.correlation_penalty) or not 0.0 <= self.correlation_penalty < 1.0:
+            raise ValueError("correlation_penalty must be in [0, 1)")
+        self.priors = tuple(priors.tolist())
 
 
 @dataclass
@@ -124,14 +111,13 @@ class ChainFactorSummary:
     gamma_coverage: float = 0.0
     delta_coverage: float = 0.0
     vega_coverage: float = 0.0
-
-
-@dataclass(frozen=True)
-class ShortFactor:
-    signal: float
-    confidence: float
-    pressure: float
-    squeeze: float
+    iv_skew_coverage: float = 0.0
+    iv_term_coverage: float = 0.0
+    iv_fit_coverage: float = 0.0
+    quote_coverage: float = 0.0
+    option_activity: float = 0.0
+    option_activity_coverage: float = 0.0
+    gamma_concentration: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -141,12 +127,17 @@ class FactorBlend:
     projected_variance: float
     weights: np.ndarray
     table: pd.DataFrame
+    neutral_weight: float = 1.0
+    kkt_residual: float = 0.0
 
 
 def _numeric(frame: pd.DataFrame, name: str, default: float = np.nan) -> np.ndarray:
     if name not in frame:
         return np.full(len(frame), default, dtype=float)
-    return pd.to_numeric(frame[name], errors="coerce").to_numpy(float)
+    column = frame[name]
+    if isinstance(column.dtype, np.dtype) and column.dtype.kind in "biuf":
+        return column.to_numpy(dtype=float, copy=False)
+    return pd.to_numeric(column, errors="coerce").to_numpy(float)
 
 
 def _expiry(frame: pd.DataFrame) -> np.ndarray:
@@ -161,7 +152,7 @@ def _mid(frame: pd.DataFrame, side: str) -> np.ndarray:
     ask = _numeric(frame, f"{side}_ask")
     explicit = _numeric(frame, f"{side}_mid")
     last = _numeric(frame, f"{side}_last")
-    valid = np.isfinite(bid) & np.isfinite(ask) & (ask >= bid) & (ask > 0.0)
+    valid = np.isfinite(bid) & np.isfinite(ask) & (bid >= 0.0) & (ask >= bid) & (ask > 0.0)
     result = np.where(valid, 0.5 * (bid + ask), explicit)
     result = np.where(np.isfinite(result) & (result > 0.0), result, last)
     return np.maximum(np.nan_to_num(result, nan=0.0), 0.0)
@@ -241,8 +232,8 @@ def _chain_arrays(chain: pd.DataFrame, previous_chain: pd.DataFrame | None) -> l
         np.ascontiguousarray(_numeric(chain, "call_ask")),
         np.ascontiguousarray(_numeric(chain, "put_bid")),
         np.ascontiguousarray(_numeric(chain, "put_ask")),
-        np.ascontiguousarray(np.maximum(np.nan_to_num(_numeric(chain, "call_volume"), nan=0.0), 0.0)),
-        np.ascontiguousarray(np.maximum(np.nan_to_num(_numeric(chain, "put_volume"), nan=0.0), 0.0)),
+        np.ascontiguousarray(np.maximum(_numeric(chain, "call_volume"), 0.0)),
+        np.ascontiguousarray(np.maximum(_numeric(chain, "put_volume"), 0.0)),
         np.ascontiguousarray(np.maximum(np.nan_to_num(_numeric(chain, "call_oi"), nan=0.0), 0.0)),
         np.ascontiguousarray(np.maximum(np.nan_to_num(_numeric(chain, "put_oi"), nan=0.0), 0.0)),
         np.ascontiguousarray(_oi_change(chain, previous_chain, "call")),
@@ -265,6 +256,12 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
         call_volume, put_volume, call_oi, put_oi, call_oi_change, put_oi_change,
         call_iv, put_iv, call_delta, put_delta, call_gamma, put_gamma, _call_vega, _put_vega,
     ) = arrays
+    activity_observed = ((np.isfinite(call_volume) & np.isfinite(call_delta))
+                         | (np.isfinite(put_volume) & np.isfinite(put_delta)))
+    delta_activity = (np.where(np.isfinite(call_volume) & np.isfinite(call_delta), call_volume * np.abs(call_delta), 0.0)
+                      + np.where(np.isfinite(put_volume) & np.isfinite(put_delta), put_volume * np.abs(put_delta), 0.0))
+    call_volume = np.nan_to_num(call_volume, nan=0.0)
+    put_volume = np.nan_to_num(put_volume, nan=0.0)
     log_moneyness = np.log(np.maximum(strike, EPS) / spot)
     base_weight = np.exp(-np.abs(log_moneyness) / 0.08) * np.exp(-expiry / 45.0)
     call_delta_abs = np.where(np.isfinite(call_delta), np.abs(call_delta), 0.5)
@@ -272,8 +269,8 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
     call_energy = float(np.sum(call_price * call_volume * 100.0 * call_delta_abs * base_weight))
     put_energy = float(np.sum(put_price * put_volume * 100.0 * put_delta_abs * base_weight))
     energy_signal = float(np.tanh((call_energy - put_energy) / max(call_energy + put_energy, EPS)))
-    valid_call_quote = np.isfinite(call_bid) & np.isfinite(call_ask) & (call_ask >= call_bid) & (call_ask > 0.0)
-    valid_put_quote = np.isfinite(put_bid) & np.isfinite(put_ask) & (put_ask >= put_bid) & (put_ask > 0.0)
+    valid_call_quote = np.isfinite(call_bid) & np.isfinite(call_ask) & (call_bid >= 0.0) & (call_ask >= call_bid) & (call_ask > 0.0)
+    valid_put_quote = np.isfinite(put_bid) & np.isfinite(put_ask) & (put_bid >= 0.0) & (put_ask >= put_bid) & (put_ask > 0.0)
     call_quality = np.where(valid_call_quote, np.exp(-4.0 * np.maximum(call_ask - call_bid, 0.0) / np.maximum(call_price, EPS)), 0.0)
     put_quality = np.where(valid_put_quote, np.exp(-4.0 * np.maximum(put_ask - put_bid, 0.0) / np.maximum(put_price, EPS)), 0.0)
     activity = 1.0 + np.log1p(call_volume + put_volume)
@@ -323,6 +320,8 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
     call_gex = call_oi * np.nan_to_num(np.abs(call_gamma)) * 100.0 * spot * spot * base_weight
     put_gex = put_oi * np.nan_to_num(np.abs(put_gamma)) * 100.0 * spot * spot * base_weight
     gross_gex = float(call_gex.sum() + put_gex.sum())
+    strike_gex = pd.Series(call_gex + put_gex, index=strike).groupby(level=0).sum()
+    gamma_concentration = float(strike_gex.max() / gross_gex) if gross_gex > EPS else 0.0
     rows = max(len(chain), 1)
     oi_change_coverage = float(np.count_nonzero(
         np.isfinite(call_oi_change) | np.isfinite(put_oi_change)
@@ -354,6 +353,14 @@ def _extract_chain_python(chain: pd.DataFrame, spot: float, realized_vol: float,
         "gex_confidence": float(np.clip(0.6 * np.count_nonzero(np.isfinite(call_gamma) | np.isfinite(put_gamma)) / rows, 0.0, 0.6)),
         "liquidity_quality": liquidity,
         "iv_coverage": float(np.count_nonzero(valid_iv) / rows),
+        "iv_skew_coverage": float(has_two_sided_iv),
+        "iv_term_coverage": float(np.any(near) and np.any(far)),
+        "iv_fit_coverage": float(np.linalg.matrix_rank(design[:, :3]) == 3) if np.count_nonzero(valid_iv) >= 4 else 0.0,
+        "quote_coverage": float(np.mean((np.isfinite(call_bid) & np.isfinite(call_ask) & (call_bid >= 0) & (call_ask >= call_bid) & (call_ask > 0))
+                                       | (np.isfinite(put_bid) & np.isfinite(put_ask) & (put_bid >= 0) & (put_ask >= put_bid) & (put_ask > 0)))),
+        "option_activity": float(np.log1p(delta_activity.sum())),
+        "option_activity_coverage": float(np.count_nonzero(activity_observed) / rows),
+        "gamma_concentration": gamma_concentration,
         "gamma_coverage": float(np.count_nonzero(np.isfinite(call_gamma) | np.isfinite(put_gamma)) / rows),
         "delta_coverage": float(np.count_nonzero(np.isfinite(call_delta) | np.isfinite(put_delta)) / rows),
         "vega_coverage": 0.0,
@@ -407,13 +414,15 @@ def stock_confirmation(state: Any) -> tuple[float, float]:
     weights: list[float] = []
     spot = float(getattr(state, "spot", 0.0))
     realized_vol = float(getattr(state, "realized_vol", 0.0) or 0.0)
+    if not np.isfinite(realized_vol):
+        realized_vol = 0.0
     previous_close = getattr(state, "previous_close", None)
-    if previous_close is not None and previous_close > 0.0 and spot > 0.0:
+    if previous_close is not None and np.isfinite(previous_close) and previous_close > 0.0 and np.isfinite(spot) and spot > 0.0:
         daily_scale = max(realized_vol / np.sqrt(252.0), 0.005)
         components.append(float(np.log(spot / previous_close) / daily_scale))
         weights.append(0.25)
     vwap = getattr(state, "vwap", None)
-    if vwap is not None and vwap > 0.0:
+    if vwap is not None and np.isfinite(vwap) and vwap > 0.0 and np.isfinite(spot) and spot > 0.0:
         components.append(float((spot - vwap) / vwap / 0.003))
         weights.append(0.25)
     return_5m = getattr(state, "return_5m", None)
@@ -425,54 +434,18 @@ def stock_confirmation(state: Any) -> tuple[float, float]:
         components.append(float(return_15m) / 0.006)
         weights.append(0.15)
     rvol = getattr(state, "rvol", None)
-    if rvol is not None and rvol > 0.0:
-        components.append(float(np.log(max(rvol, EPS))))
-        weights.append(0.10)
     if not weights:
         return 0.0, 0.0
+    # Volume has no buy/sell sign. It may change the reliability of already
+    # observed price direction, but cannot cast an independent bullish vote.
+    volume_quality = .75
+    if rvol is not None and np.isfinite(rvol) and rvol > 0.0:
+        volume_quality = float(.75 + .25 * np.tanh(np.log(max(rvol, EPS))))
     weight_array = np.asarray(weights, dtype=float)
     raw = float(np.dot(weight_array, np.asarray(components, dtype=float)) / weight_array.sum())
-    data_confidence = float(np.clip(getattr(state, "data_confidence", 1.0), 0.0, 1.0))
-    return float(np.tanh(raw)), float(np.clip(len(weights) / 5.0 * data_confidence, 0.0, 1.0))
-
-
-def short_pressure(short_data: ShortData | None, stock_signal: float) -> ShortFactor:
-    """Map observable short pressure and squeeze interaction to one signal."""
-
-    if short_data is None:
-        return ShortFactor(0.0, 0.0, 0.0, 0.0)
-    values = [
-        short_data.short_interest_ratio,
-        short_data.short_interest_change,
-        short_data.short_volume_ratio,
-        short_data.borrow_fee,
-        short_data.utilization,
-        short_data.days_to_cover,
-    ]
-    numbers = [np.nan if value is None else float(value) for value in values]
-    if HAS_CPP_CORE and hasattr(cpp_core, "compute_short_factor"):
-        result = cpp_core.compute_short_factor(*numbers, float(stock_signal), float(short_data.confidence))
-        return ShortFactor(float(result["signal"]), float(result["confidence"]), float(result["pressure"]), float(result["squeeze"]))
-    importance = np.asarray((0.15, 0.25, 0.20, 0.15, 0.15, 0.10), dtype=float)
-    features = np.asarray((
-        np.tanh((numbers[0] - 0.10) / 0.15),
-        np.tanh(numbers[1] / 0.10),
-        np.tanh((numbers[2] - 0.50) / 0.20),
-        np.tanh(np.log1p(max(numbers[3], 0.0)) / 0.10),
-        np.tanh((numbers[4] - 0.50) / 0.25),
-        np.tanh((numbers[5] - 2.0) / 3.0),
-    ))
-    valid = np.isfinite(features)
-    if not np.any(valid):
-        return ShortFactor(0.0, 0.0, 0.0, 0.0)
-    pressure = float(np.dot(importance[valid], features[valid]) / importance[valid].sum())
-    squeeze = 1.60 * max(pressure, 0.0) * max(stock_signal, 0.0)
-    return ShortFactor(
-        float(np.clip(-pressure + squeeze, -1.0, 1.0)),
-        float(np.clip(short_data.confidence, 0.0, 1.0) * np.count_nonzero(valid) / 6.0),
-        pressure,
-        squeeze,
-    )
+    data_confidence = float(getattr(state, "data_confidence", 1.0))
+    data_confidence = float(np.clip(data_confidence, 0.0, 1.0)) if np.isfinite(data_confidence) else 0.0
+    return float(np.tanh(raw)), float(np.clip(len(weights) / 4.0 * volume_quality * data_confidence, 0.0, 1.0))
 
 
 def adaptive_blend(
@@ -481,16 +454,34 @@ def adaptive_blend(
     state: FactorState,
     config: FactorConfig,
 ) -> FactorBlend:
-    """Update EWMA covariance and compute non-negative ridge-GLS weights."""
+    """Solve a strictly convex, box-constrained correlation-budget problem.
 
-    factors = np.clip(np.asarray(values, dtype=float), -1.0, 1.0)
-    quality = np.clip(np.asarray(confidences, dtype=float), 0.0, 1.0)
+    ``u = budget * observation_quality`` and ``H = (1-penalty)*I + penalty*R``, with
+    ``R = (1-shrinkage) * correlation**2 + shrinkage * I`` (elementwise square).
+    Minimize ``0.5*w.T@H@w - u.T@w`` subject to ``0 <= w <= u``.
+    For 0<=penalty<1 the Schur product theorem makes H positive definite.
+    Its diagonal is one: an isolated valid factor is not penalized for being
+    correlated with itself. The unused mass is an explicit neutral reserve. No normalization
+    or inverse covariance solve can transfer absent evidence into premium ELO.
+    """
+
+    factors = np.asarray(values, dtype=float)
+    quality = np.asarray(confidences, dtype=float)
     if factors.shape != (len(config.names),) or quality.shape != factors.shape:
         raise ValueError("factor vector does not match FactorConfig")
+    valid = np.isfinite(factors) & np.isfinite(quality)
+    factors = np.where(valid, np.clip(factors, -1.0, 1.0), 0.0)
+    quality = np.where(valid, np.clip(quality, 0.0, 1.0), 0.0)
     quality = np.where(quality >= config.minimum_confidence, quality, 0.0)
     priors = np.asarray(config.priors, dtype=float)
-    if HAS_CPP_CORE and hasattr(cpp_core, "blend_factors"):
-        result = cpp_core.blend_factors(
+    if (state.mean.shape != factors.shape
+            or state.covariance.shape != (factors.size, factors.size)
+            or not np.all(np.isfinite(state.mean))
+            or not np.all(np.isfinite(state.covariance))
+            or not np.isfinite(state.count) or state.count < 0.0):
+        raise ValueError("invalid factor covariance state")
+    if HAS_CPP_CORE and hasattr(cpp_core, "blend_factor_budgets"):
+        result = cpp_core.blend_factor_budgets(
             np.ascontiguousarray(factors),
             np.ascontiguousarray(quality),
             np.ascontiguousarray(priors),
@@ -498,7 +489,8 @@ def adaptive_blend(
             np.ascontiguousarray(state.covariance.ravel()),
             float(state.count),
             float(config.ewma_alpha),
-            float(config.covariance_ridge),
+            float(config.correlation_penalty),
+            float(config.covariance_shrinkage),
         )
         state.mean = np.asarray(result["mean"], dtype=float)
         state.covariance = np.asarray(result["covariance"], dtype=float).reshape(factors.size, factors.size)
@@ -507,32 +499,59 @@ def adaptive_blend(
         signal = float(result["signal"])
         confidence = float(result["confidence"])
         projected_variance = float(result["projected_variance"])
+        kkt_residual = float(result["kkt_residual"])
     else:
-        if state.count <= 0.0:
-            state.mean = np.where(quality > 0.0, factors, state.mean)
-        else:
+        observed = quality > 0.0
+        if np.any(observed) and state.count <= 0.0:
+            state.mean = np.where(observed, factors, state.mean)
+        elif np.any(observed):
             old_mean = state.mean.copy()
-            state.mean = np.where(quality > 0.0, (1.0 - config.ewma_alpha) * state.mean + config.ewma_alpha * factors, state.mean)
-            innovation_old = np.where(quality > 0.0, factors - old_mean, 0.0)
-            innovation_new = np.where(quality > 0.0, factors - state.mean, 0.0)
-            state.covariance = (1.0 - config.ewma_alpha) * state.covariance + config.ewma_alpha * np.outer(innovation_old, innovation_new)
-        state.count += 1.0
-        rhs = priors * quality
-        try:
-            raw_weights = np.linalg.solve(state.covariance + config.covariance_ridge * np.eye(factors.size), rhs)
-        except np.linalg.LinAlgError:
-            raw_weights = rhs
-        raw_weights = np.maximum(np.nan_to_num(raw_weights), 0.0)
-        weights = raw_weights / raw_weights.sum() if raw_weights.sum() > EPS else np.full(factors.size, 1.0 / factors.size)
+            state.mean = np.where(observed, old_mean + config.ewma_alpha * (factors - old_mean), old_mean)
+            innovation = np.where(observed, factors - old_mean, 0.0)
+            # D Sigma D + alpha*(1-alpha)*v*v.T preserves PSD. An absent
+            # factor retains its diagonal uncertainty instead of decaying to 0.
+            decay = np.where(observed, np.sqrt(1.0 - config.ewma_alpha), 1.0)
+            state.covariance = (state.covariance * np.outer(decay, decay)
+                                + config.ewma_alpha * (1.0 - config.ewma_alpha)
+                                * np.outer(innovation, innovation))
+        if np.any(observed):
+            state.count += 1.0
+        diagonal = np.maximum(np.diag(state.covariance), EPS)
+        correlation = np.clip(state.covariance / np.sqrt(np.outer(diagonal, diagonal)), -1.0, 1.0)
+        np.fill_diagonal(correlation, 1.0)
+        redundancy = ((1.0 - config.covariance_shrinkage) * correlation ** 2
+                      + config.covariance_shrinkage * np.eye(factors.size))
+        hessian = (1.0 - config.correlation_penalty) * np.eye(factors.size) + config.correlation_penalty * redundancy
+        upper = priors * quality
+        weights = upper.copy()
+        # Cyclic exact coordinate minimization; dimension <=32, bounded memory
+        # and iteration count. Strict convexity yields the unique solution.
+        for _ in range(512):
+            largest_change = 0.0
+            for index in range(factors.size):
+                off_diagonal = float(hessian[index] @ weights - hessian[index, index] * weights[index])
+                updated = float(np.clip((upper[index] - off_diagonal) / hessian[index, index], 0.0, upper[index]))
+                largest_change = max(largest_change, abs(updated - weights[index]))
+                weights[index] = updated
+            if largest_change < 1e-13:
+                break
+        gradient = hessian @ weights - upper
+        kkt_residual = float(np.max(np.abs(weights - np.clip(weights - gradient, 0.0, upper))))
         signal = float(np.clip(np.dot(weights, factors), -1.0, 1.0))
-        confidence = float(np.clip(np.dot(weights, quality), 0.0, 1.0))
+        # Quality is already applied through the eligible weight budget.
+        confidence = float(np.clip(weights.sum(), 0.0, 1.0))
         projected_variance = float(max(weights @ state.covariance @ weights, 0.0))
+    if kkt_residual > 1e-9:
+        raise RuntimeError("factor budget optimization did not converge")
+    neutral = float(np.clip(1.0 - weights.sum(), 0.0, 1.0))
     table = pd.DataFrame({
         "factor": config.names,
         "signal": factors,
         "confidence": quality,
         "prior_weight": priors,
+        "budget_cap": priors,
+        "eligible_budget": priors * quality,
         "dynamic_weight": weights,
         "contribution": weights * factors,
     }).sort_values("dynamic_weight", ascending=False, ignore_index=True)
-    return FactorBlend(signal, confidence, projected_variance, weights, table)
+    return FactorBlend(signal, confidence, projected_variance, weights, table, neutral, kkt_residual)

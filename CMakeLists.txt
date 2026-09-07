@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(OceanWaveKernelTests VERSION 1.1.0 LANGUAGES CXX)
+project(OceanWaveKernelTests VERSION 1.2.0 LANGUAGES CXX)
 include(CTest)
+
+# Retain Release assertions without MSVC's duplicate-definition warning.
+if(MSVC)
+  foreach(configuration IN ITEMS RELEASE RELWITHDEBINFO MINSIZEREL)
+    string(REPLACE "/DNDEBUG" "" CMAKE_CXX_FLAGS_${configuration} "${CMAKE_CXX_FLAGS_${configuration}}")
+  endforeach()
+endif()
 
 if(BUILD_TESTING)
   foreach(kernel IN ITEMS cpp_kernel_smoke cpp_fourier_features_test cpp_pde_stability_test cpp_online_forecast_test)

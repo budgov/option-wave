@@ -9,7 +9,7 @@ from time import sleep
 import unittest
 from unittest.mock import patch
 
-from option_wave.shadow_calibration import ShadowCalibrator
+from option_wave.shadow_calibration import BASE_MODEL_VERSION, CALIBRATION_SCHEMA, ShadowCalibrator
 
 
 @contextmanager
@@ -58,6 +58,7 @@ class ShadowCalibrationTests(unittest.TestCase):
                 patch("option_wave._atomic_io.sleep") as pause,
             ):
                 result = calibrator.apply_feedback({
+                    "base_model_version": BASE_MODEL_VERSION,
                     "event_id": "position-lock-retry",
                     "symbol": "SPY",
                     "option_type": "call",
@@ -76,6 +77,7 @@ class ShadowCalibrationTests(unittest.TestCase):
         with temporary_directory() as directory:
             calibrator = ShadowCalibrator(Path(directory), learning_rate=0.025, minimum_samples=10)
             event = {
+                "base_model_version": BASE_MODEL_VERSION,
                 "event_id": "position-1",
                 "symbol": "SPY",
                 "option_type": "call",
@@ -122,6 +124,7 @@ class ShadowCalibrationTests(unittest.TestCase):
             calibrator = ShadowCalibrator(Path(directory), minimum_samples=10)
             for index in range(40):
                 calibrator.apply_feedback({
+                    "base_model_version": BASE_MODEL_VERSION,
                     "event_id": f"two-day-{index}",
                     "symbol": "SPY",
                     "predicted_profit_probability": 0.80,
@@ -143,6 +146,7 @@ class ShadowCalibrationTests(unittest.TestCase):
             calibrator = ShadowCalibrator(Path(directory), minimum_samples=10)
             before = json.dumps(calibrator.state, sort_keys=True)
             status = calibrator.apply_feedback({
+                "base_model_version": BASE_MODEL_VERSION,
                 "event_id": "invalid-session",
                 "symbol": "QQQ",
                 "predicted_profit_probability": 0.70,
@@ -154,6 +158,57 @@ class ShadowCalibrationTests(unittest.TestCase):
             self.assertEqual(status["status"], "invalid_day_ignored")
             self.assertEqual(json.dumps(calibrator.state, sort_keys=True), before)
             self.assertFalse(calibrator.path.exists())
+
+    def test_old_model_calibration_files_are_preserved_but_never_loaded(self) -> None:
+        with temporary_directory() as directory:
+            old_files = {}
+            for version in (1, 2, 3):
+                legacy = Path(directory) / f"shadow-calibration.v{version}.json"
+                content = json.dumps({"schema_version": f"ocean-wave-shadow-calibration.v{version}",
+                    "global": {"intercept": 1.5, "slope": 1.5, "samples": 900}})
+                legacy.write_text(content, encoding="utf-8")
+                old_files[legacy] = content
+            calibrator = ShadowCalibrator(Path(directory))
+            projection = calibrator.project("SPY", 0.6)
+            self.assertEqual(projection["global_samples"], 0)
+            self.assertAlmostEqual(projection["calibrated_profit_probability"], 0.6)
+            self.assertEqual(projection["base_model_version"], BASE_MODEL_VERSION)
+            self.assertEqual(calibrator.path.name, "shadow-calibration.v4.json")
+            self.assertFalse(calibrator.path.exists())
+            for filename, content in old_files.items():
+                self.assertEqual(filename.read_text(encoding="utf-8"), content)
+
+    def test_new_filename_does_not_authorize_an_old_or_unversioned_bucket(self) -> None:
+        with temporary_directory() as directory:
+            filename = Path(directory) / "shadow-calibration.v4.json"
+            for version in (None, "ocean-wave.legacy-nine-factor.v1", "ocean-wave.group-budget.v3"):
+                payload = {"schema_version": CALIBRATION_SCHEMA,
+                    "global": {"intercept": 1.5, "slope": 1.5, "samples": 900}}
+                if version is not None:
+                    payload["base_model_version"] = version
+                filename.write_text(json.dumps(payload), encoding="utf-8")
+                before = filename.read_bytes()
+                with self.assertRaisesRegex(ValueError, "base model version"):
+                    ShadowCalibrator(Path(directory))
+                self.assertEqual(filename.read_bytes(), before)
+
+    def test_feedback_requires_the_base_model_version_frozen_at_entry(self) -> None:
+        with temporary_directory() as directory:
+            calibrator = ShadowCalibrator(Path(directory))
+            event = {"event_id": "old-position-closes-after-upgrade", "symbol": "SPY",
+                "predicted_profit_probability": 0.9, "observed_profitable": True}
+            before = json.dumps(calibrator.state, sort_keys=True)
+            for version in (None, "ocean-wave.legacy-nine-factor.v1", "ocean-wave.group-budget.v3"):
+                feedback = event if version is None else {**event, "base_model_version": version}
+                result = calibrator.apply_feedback(feedback)
+                self.assertEqual(result["status"], "incompatible_base_model_ignored")
+                self.assertEqual(json.dumps(calibrator.state, sort_keys=True), before)
+                self.assertFalse(calibrator.path.exists())
+            result = calibrator.apply_feedback({**event, "base_model_version": BASE_MODEL_VERSION})
+            self.assertEqual(result["status"], "updated")
+            persisted = json.loads(calibrator.path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["schema_version"], CALIBRATION_SCHEMA)
+            self.assertEqual(persisted["base_model_version"], BASE_MODEL_VERSION)
 
 
 if __name__ == "__main__":

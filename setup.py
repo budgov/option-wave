@@ -17,7 +17,7 @@ if os.getenv("OCEAN_WAVE_NATIVE") == "1" and sys.platform not in {"darwin", "win
 
 setup(
     name="ocean-wave",
-    version="1.1.0",
+    version="1.2.0",
     packages=["option_wave"],
     ext_modules=[
         Pybind11Extension(

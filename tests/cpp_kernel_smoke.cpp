@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -34,7 +35,21 @@ int main() {
         101.0, 100.0, 100.5, 0.003, 0.006, 1.2, 0.20, 1.0
     );
     require(stock.signal > 0.0, "stock signal");
-    require(stock.confidence > 0.99, "stock confidence");
+    const double expected_volume_quality = 0.75 + 0.25 * std::tanh(std::log(1.2));
+    require(std::abs(stock.confidence - expected_volume_quality) < 1e-12, "stock volume reliability gate");
+    const double missing = std::numeric_limits<double>::quiet_NaN();
+    for (double relative_volume : {0.2, 1.0, 2.0, 10.0}) {
+        const auto volume_only = ocean_wave::stock_confirmation(
+            100.0, missing, missing, missing, missing, relative_volume, 0.2, 1.0);
+        require(volume_only.signal == 0.0 && volume_only.confidence == 0.0,
+            "unsigned RVOL alone cannot predict direction");
+        const auto up = ocean_wave::stock_confirmation(
+            100.0, missing, missing, 0.003, 0.006, relative_volume, 0.2, 1.0);
+        const auto down = ocean_wave::stock_confirmation(
+            100.0, missing, missing, -0.003, -0.006, relative_volume, 0.2, 1.0);
+        require(std::abs(up.signal + down.signal) < 1e-12, "RVOL must preserve price-sign symmetry");
+        require(up.confidence == down.confidence, "RVOL confidence cannot prefer bullish prices");
+    }
 
     const auto forecast = ocean_wave::forecast_surface(
         {0.0, 0.0, 1.0, 1.0},

@@ -43,7 +43,17 @@ def _column(frame: pd.DataFrame, name: str, default: float = 0.0) -> np.ndarray:
 
     if name not in frame:
         return np.full(len(frame), default, dtype=float)
-    return pd.to_numeric(frame[name], errors="coerce").fillna(default).to_numpy(float)
+    column = frame[name]
+    # Provider-normalized numeric columns already have the required semantics.
+    # Keep coercion for object/string and nullable extension dtypes, and never
+    # mutate a borrowed NumPy view while substituting an ELO missing-value default.
+    if isinstance(column.dtype, np.dtype) and column.dtype.kind in "biuf":
+        values = column.to_numpy(dtype=float, copy=False)
+        if np.isnan(default):
+            return values
+        missing = np.isnan(values)
+        return np.where(missing, default, values) if missing.any() else values
+    return pd.to_numeric(column, errors="coerce").fillna(default).to_numpy(float)
 
 
 def _mid_and_variance(frame: pd.DataFrame, side: str, cfg: EloConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -54,7 +64,7 @@ def _mid_and_variance(frame: pd.DataFrame, side: str, cfg: EloConfig) -> tuple[n
     last = _column(frame, f"{side}_last", np.nan)
     mid = _column(frame, f"{side}_mid", np.nan)
 
-    quoted = np.isfinite(bid) & np.isfinite(ask) & (ask >= bid) & (ask > 0)
+    quoted = np.isfinite(bid) & np.isfinite(ask) & (bid >= 0.0) & (ask >= bid) & (ask > 0)
     mid = np.where(quoted, (bid + ask) / 2.0, mid)
     mid = np.where(np.isfinite(mid) & (mid > 0), mid, last)
     mid = np.maximum(np.nan_to_num(mid, nan=0.0), EPS)

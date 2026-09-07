@@ -1,17 +1,16 @@
 """Ocean Wave: C++ accelerated option-surface forecasting.
 
-The model combines a symmetric premium-ELO surface with verified institutional
-flow, dealer hedging, IV geometry, short pressure, OI changes, stock
-confirmation, inverse instruments, and liquidity-adjusted energy.  Factor
-priors are reweighted online by an EWMA covariance matrix before a continuous
-PDE is integrated over each forecast horizon.
+The model combines budget-limited premium ELO, IV geometry, stock and inverse
+confirmation, and verified macro signals. Missing evidence remains neutral;
+liquidity, unsigned option inventory, and macro stress inform risk rather than
+inventing institutional trading direction.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from math import erf, exp, sqrt
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -19,17 +18,15 @@ import pandas as pd
 from ._backend import HAS_CPP_CORE, cpp_core
 from .elo import EPS, EloConfig, build_elo_surface, energy_cost, premium_sentiment_elo
 from .factors import (
+    FACTOR_NAMES,
     ChainFactorSummary,
     FactorBlend,
     FactorConfig,
     FactorState,
-    ShortData,
     adaptive_blend,
     extract_chain_factors,
-    short_pressure,
     stock_confirmation,
 )
-from .flow import FlowConfig, FlowSummary, aggregate_large_flow
 from .inverse import InverseMarketData
 
 
@@ -81,8 +78,6 @@ class PDEConfig:
     timestep_minutes: float = 1.0
     default_volatility: float = 0.25
     trading_minutes_per_year: float = 252.0 * 390.0
-    negative_gamma_amplifier: float = 0.35
-    positive_gamma_dampener: float = 0.20
     liquidity_diffusion_penalty: float = 0.50
     vrp_variance_scale: float = 1.50
 
@@ -98,7 +93,6 @@ class ModelConfig:
     elo: EloConfig = field(default_factory=EloConfig)
     factors: FactorConfig = field(default_factory=FactorConfig)
     pde: PDEConfig = field(default_factory=PDEConfig)
-    flow: FlowConfig = field(default_factory=FlowConfig)
     inverse: InverseConfig = field(default_factory=InverseConfig)
     forecast_horizons_minutes: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0)
     minimum_actionable_edge: float = 0.10
@@ -130,7 +124,6 @@ class ModelResult:
     factor_table: pd.DataFrame
     factor_covariance: np.ndarray
     chain_factors: ChainFactorSummary
-    flow_summary: FlowSummary | None
     expectations: dict[float, Expectation]
     elo_surface: pd.DataFrame
     distance_grid: np.ndarray
@@ -402,12 +395,16 @@ class OceanWave:
 
     def __init__(self, config: ModelConfig | None = None) -> None:
         self.config = config or ModelConfig()
+        if self.config.factors.names != FACTOR_NAMES:
+            raise ValueError("Ocean Wave requires the named eight-factor budget schema")
         self._ratings: dict[tuple[str, float, float], float] = {}
         self._factor_state = FactorState.create(self.config.factors)
+        self._state_migration: str | None = None
 
     def reset(self) -> None:
         self._ratings.clear()
         self._factor_state = FactorState.create(self.config.factors)
+        self._state_migration = None
 
     def state_dict(self) -> dict[str, object]:
         """Return a JSON-serializable online state for one underlying symbol."""
@@ -422,7 +419,11 @@ class OceanWave:
             for key, value in sorted(self._ratings.items(), key=lambda item: item[0])
         ]
         return {
-            "schema_version": "ocean-wave-state.v1",
+            "schema_version": "ocean-wave-state.v3",
+            "weighting_scheme": "bounded-correlation-budget.v2",
+            "factor_names": list(self.config.factors.names),
+            "factor_budgets": list(self.config.factors.priors),
+            "state_migration": self._state_migration,
             "ratings": ratings,
             "factor_state": {
                 "mean": self._factor_state.mean.tolist(),
@@ -434,10 +435,14 @@ class OceanWave:
     def load_state_dict(self, payload: dict[str, object]) -> None:
         """Restore validated online state without using executable pickle data."""
 
-        if payload.get("schema_version") != "ocean-wave-state.v1":
+        schema = payload.get("schema_version")
+        if schema not in {"ocean-wave-state.v1", "ocean-wave-state.v2", "ocean-wave-state.v3"}:
             raise ValueError("unsupported Ocean Wave state schema")
         restored_ratings: dict[tuple[str, float, float], float] = {}
-        for item in payload.get("ratings", []):
+        rating_entries = payload.get("ratings", [])
+        if not isinstance(rating_entries, list) or len(rating_entries) > 20000:
+            raise ValueError("invalid or excessive ELO rating state")
+        for item in rating_entries:
             if not isinstance(item, dict):
                 raise ValueError("invalid rating state entry")
             key = (
@@ -446,9 +451,24 @@ class OceanWave:
                 float(item["distance_pct"]),
             )
             value = float(item["rating"])
-            if not np.isfinite(value):
+            if (key[0] not in {"call", "put"} or not np.isfinite(key[1]) or not np.isfinite(key[2])
+                    or key[1] < 0.0 or key[2] < 0.0 or not np.isfinite(value)):
                 raise ValueError("rating state must be finite")
             restored_ratings[key] = value
+
+        if schema == "ocean-wave-state.v1":
+            # V1's unnamed nine-dimensional covariance encoded deleted factors
+            # and normalized-away missing budgets. Never import those weights.
+            self._ratings = restored_ratings
+            self._factor_state = FactorState.create(self.config.factors)
+            self._state_migration = "v1_factor_covariance_reset_preserved_elo_ratings"
+            return
+        expected_scheme = ("bounded-correlation-budget.v1" if schema == "ocean-wave-state.v2"
+                           else "bounded-correlation-budget.v2")
+        if (payload.get("weighting_scheme") != expected_scheme
+                or payload.get("factor_names") != list(self.config.factors.names)
+                or payload.get("factor_budgets") != list(self.config.factors.priors)):
+            raise ValueError("incompatible named factor budget state")
 
         factor = payload.get("factor_state")
         if not isinstance(factor, dict):
@@ -460,12 +480,25 @@ class OceanWave:
             raise ValueError("factor state has incompatible dimensions")
         if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(covariance)):
             raise ValueError("factor state must be finite")
+        if (not np.allclose(covariance, covariance.T, atol=1e-12, rtol=1e-12)
+                or float(np.min(np.linalg.eigvalsh(covariance))) < -1e-10):
+            raise ValueError("factor covariance must be symmetric positive semidefinite")
         count = float(factor.get("count", 0.0))
         if not np.isfinite(count) or count < 0.0:
             raise ValueError("factor state count is invalid")
 
+        if schema == "ocean-wave-state.v2":
+            # Old quality/self-correlation penalties define a different base.
+            # Preserve validated ELO observations, but not old blend state.
+            self._ratings = restored_ratings
+            self._factor_state = FactorState.create(self.config.factors)
+            self._state_migration = "v2_factor_covariance_reset_preserved_elo_ratings"
+            return
+
         self._ratings = restored_ratings
         self._factor_state = FactorState(mean=mean, covariance=covariance, count=count)
+        migration = payload.get("state_migration")
+        self._state_migration = migration if isinstance(migration, str) else None
 
     def _inverse_observation(
         self,
@@ -473,8 +506,26 @@ class OceanWave:
         inverse_state: MarketState | None,
         inverse_beta: float,
     ) -> tuple[float, float, float]:
-        if inverse_state is None or inverse_state.spot <= 0.0:
+        if inverse_state is None or not np.isfinite(inverse_state.spot) or inverse_state.spot <= 0.0:
             return 0.0, 0.0, 0.0
+        if not np.isfinite(inverse_state.data_confidence):
+            return 0.0, 0.0, 0.0
+        if not np.isfinite(inverse_beta) or inverse_beta >= 0.0:
+            return 0.0, 0.0, 0.0
+        for name, minutes in (("return_5m", 5.0), ("return_15m", 15.0)):
+            observed_return = getattr(inverse_state, name, None)
+            if observed_return is None or not np.isfinite(observed_return) or observed_return <= -1.0:
+                continue
+            inverse_log_return = float(np.log1p(observed_return))
+            native_volatility = float(inverse_state.realized_vol or (self.config.pde.default_volatility * abs(inverse_beta)))
+            if not np.isfinite(native_volatility) or native_volatility <= 0.0:
+                return 0.0, 0.0, 0.0
+            target_volatility = max(native_volatility / abs(inverse_beta), 1e-6)
+            target_return = inverse_log_return / inverse_beta
+            scale = target_volatility * sqrt(minutes / self.config.pde.trading_minutes_per_year)
+            target = float(np.tanh(target_return / max(scale, EPS)))
+            quality = float(np.clip(inverse_state.data_confidence, 0.0, 1.0))
+            return -target, target, quality
         if inverse_chain is not None and not inverse_chain.empty:
             inverse_surface = build_elo_surface(inverse_chain, inverse_state.spot, self.config.elo, {})
             price_signal = 2.0 * inverse_surface["effective_score"].to_numpy(float) - 1.0
@@ -484,9 +535,15 @@ class OceanWave:
             quality = _weighted_mean(confidence, inverse_surface["pair_weight"].to_numpy(float))
         elif inverse_state.previous_close is not None and inverse_state.previous_close > 0.0:
             inverse_return = np.log(inverse_state.spot / inverse_state.previous_close)
-            scale = max(inverse_state.realized_vol or self.config.pde.default_volatility, 1e-6)
+            native_volatility = inverse_state.realized_vol or self.config.pde.default_volatility * abs(inverse_beta)
+            if not np.isfinite(native_volatility) or native_volatility <= 0.0:
+                return 0.0, 0.0, 0.0
+            elapsed = float(inverse_state.minutes_from_open or 390.0)
+            elapsed = float(np.clip(elapsed, 1.0, 390.0))
+            scale = max(native_volatility * sqrt(elapsed / self.config.pde.trading_minutes_per_year), 1e-6)
             native = float(np.tanh(inverse_return / scale))
-            quality = 0.5
+            quality = 0.25 * float(np.clip(inverse_state.data_confidence, 0.0, 1.0))
+            return native, -native, quality
         else:
             return 0.0, 0.0, 0.0
         if inverse_beta != 0.0:
@@ -530,93 +587,68 @@ class OceanWave:
 
     def _dynamic_pde_config(self, chain_summary: ChainFactorSummary) -> tuple[PDEConfig, float]:
         base = self.config.pde
-        negative_gamma = max(-chain_summary.gex_balance, 0.0)
-        positive_gamma = max(chain_summary.gex_balance, 0.0)
-        gamma_multiplier = max(
-            0.50,
-            1.0 + base.negative_gamma_amplifier * negative_gamma - base.positive_gamma_dampener * positive_gamma,
-        )
         illiquidity = 1.0 - float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
         vrp_stress = min(abs(chain_summary.volatility_risk_premium), 0.50)
+        # Call-minus-put OI*Gamma does not identify dealer inventory. Retain
+        # those observables for audit, not an assumed signed hedge multiplier.
         return replace(
             base,
             distance_diffusion=base.distance_diffusion * (1.0 + base.liquidity_diffusion_penalty * illiquidity + vrp_stress),
             expiry_diffusion=base.expiry_diffusion * (1.0 + 0.50 * vrp_stress),
-            decay=base.decay * (1.0 + 0.25 * positive_gamma - 0.20 * negative_gamma),
-            source_strength=base.source_strength * gamma_multiplier,
-        ), gamma_multiplier
+        ), 1.0
 
     def _factor_observations(
         self,
-        surface: pd.DataFrame,
         premium_signal: float,
         mean_pair_confidence: float,
         chain_summary: ChainFactorSummary,
         state: MarketState,
-        short_data: ShortData | None,
-        flow_summary: FlowSummary | None,
         inverse_target_signal: float,
         inverse_confidence: float,
-    ) -> tuple[list[float], list[float], dict[str, float]]:
+        market_context: Mapping[str, object] | None,
+    ) -> tuple[list[float], list[float], dict[str, object]]:
         liquidity = float(np.clip(chain_summary.liquidity_quality, 0.0, 1.0))
         premium_confidence = mean_pair_confidence * (0.40 + 0.60 * liquidity)
-
-        if flow_summary is not None and flow_summary.gross_notional > 0.0:
-            primary_flow = flow_summary.large_signal if flow_summary.large_gross_notional > 0.0 else flow_summary.signal
-            flow_signal = float(np.tanh(0.75 * primary_flow + 0.25 * flow_summary.velocity))
-            flow_confidence = flow_summary.confidence * (1.0 if flow_summary.large_gross_notional > 0.0 else 0.75)
-        else:
-            flow_signal = 0.0
-            flow_confidence = 0.0
-
-        dealer_values: list[float] = []
-        dealer_confidences: list[float] = []
-        if flow_summary is not None and flow_summary.greek_coverage > 0.0:
-            dealer_values.append(flow_summary.hedge_signal)
-            dealer_confidences.append(flow_summary.confidence * flow_summary.greek_coverage)
-        if chain_summary.gex_confidence > 0.0:
-            structural = chain_summary.energy_signal * (1.0 - 0.50 * chain_summary.gex_balance)
-            dealer_values.append(float(np.clip(structural, -1.0, 1.0)))
-            dealer_confidences.append(0.50 * chain_summary.gex_confidence * chain_summary.energy_confidence)
-        dealer_signal, dealer_confidence = _combine_indicators(dealer_values, dealer_confidences)
-
         stock_signal, stock_confidence = stock_confirmation(state)
-        short_factor = short_pressure(short_data, stock_signal)
-        values = [
-            premium_signal,
-            flow_signal,
-            dealer_signal,
-            chain_summary.iv_surface_signal,
-            short_factor.signal,
-            chain_summary.oi_signal,
-            stock_signal,
-            inverse_target_signal,
-            chain_summary.energy_signal,
-        ]
-        confidences = [
-            premium_confidence,
-            flow_confidence,
-            dealer_confidence,
-            chain_summary.iv_confidence,
-            short_factor.confidence,
-            chain_summary.oi_confidence,
-            stock_confidence,
-            inverse_confidence if inverse_confidence >= self.config.inverse.minimum_confidence else 0.0,
-            chain_summary.energy_confidence,
-        ]
-        details = {
+        context = market_context or {}
+        if not isinstance(context, Mapping):
+            raise ValueError("market_context must be a mapping")
+
+        def observed(value: object, confidence: object) -> tuple[float, float]:
+            if value is None:
+                return 0.0, 0.0
+            try:
+                signal_value, quality = float(value), float(confidence)
+            except (TypeError, ValueError):
+                return 0.0, 0.0
+            if not np.isfinite(signal_value) or not np.isfinite(quality):
+                return 0.0, 0.0
+            return float(np.clip(signal_value, -1.0, 1.0)), float(np.clip(quality, 0.0, 1.0))
+
+        if "inverse_signal" in context:
+            inverse_target_signal, inverse_confidence = observed(
+                context.get("inverse_signal"), context.get("inverse_confidence", 0.0)
+            )
+        macro_signals = context.get("macro_signals") or {}
+        macro_confidences = context.get("macro_confidences") or {}
+        if not isinstance(macro_signals, Mapping) or not isinstance(macro_confidences, Mapping):
+            raise ValueError("macro signals and confidences must be mappings")
+        macro = [observed(macro_signals.get(name), macro_confidences.get(name, 0.0))
+                 for name in ("gold", "treasury_10y", "dollar_index", "vix")]
+        values = [premium_signal, chain_summary.iv_surface_signal, stock_signal, inverse_target_signal,
+                  *(item[0] for item in macro)]
+        confidences = [premium_confidence, chain_summary.iv_confidence, stock_confidence,
+                       inverse_confidence if inverse_confidence >= self.config.inverse.minimum_confidence else 0.0,
+                       *(item[1] for item in macro)]
+        details: dict[str, object] = {
             "premium_signal": premium_signal,
             "premium_confidence": premium_confidence,
-            "flow_signal": flow_signal,
-            "flow_confidence": flow_confidence,
-            "dealer_signal": dealer_signal,
-            "dealer_confidence": dealer_confidence,
             "stock_signal": stock_signal,
             "stock_confidence": stock_confidence,
-            "short_signal": short_factor.signal,
-            "short_confidence": short_factor.confidence,
-            "short_pressure": short_factor.pressure,
-            "short_squeeze": short_factor.squeeze,
+            "macro_directional_observations": sum(item[1] > 0.0 for item in macro),
+            "weighting_scheme": "bounded-correlation-budget.v2",
+            "deleted_directional_factors": ["institutional_flow", "dealer_hedge",
+                                            "short_pressure", "oi_positioning", "liquidity_energy"],
         }
         return values, confidences, details
 
@@ -655,14 +687,12 @@ class OceanWave:
         *,
         horizons_minutes: tuple[float, ...] | None = None,
         previous_chain: pd.DataFrame | None = None,
-        short_data: ShortData | None = None,
-        flow: pd.DataFrame | None = None,
-        flow_asof: pd.Timestamp | str | None = None,
         inverse_chain: pd.DataFrame | None = None,
         inverse_state: MarketState | None = None,
         inverse_beta: float | None = None,
         inverse_markets: Sequence[InverseMarketData] | None = None,
         event_context: EventContext | None = None,
+        market_context: Mapping[str, object] | None = None,
         training_day_valid: bool = True,
     ) -> ModelResult:
         """Calculate the Ocean Wave field and integrated price expectations.
@@ -677,6 +707,15 @@ class OceanWave:
             raise ValueError("state.spot must be positive")
         if not isinstance(training_day_valid, bool):
             raise TypeError("training_day_valid must be bool")
+        if market_context is not None and not isinstance(market_context, Mapping):
+            raise ValueError("market_context must be a mapping")
+        context = market_context or {}
+        for name in ("macro_signals", "macro_confidences"):
+            if context.get(name) is not None and not isinstance(context[name], Mapping):
+                raise ValueError(f"{name} must be a mapping")
+        macro_risk_multiplier = float(context.get("risk_multiplier", 1.0))
+        if not np.isfinite(macro_risk_multiplier) or macro_risk_multiplier < 1.0:
+            raise ValueError("market context risk_multiplier must be finite and at least one")
         ratings = self._ratings if training_day_valid else dict(self._ratings)
         factor_state = self._factor_state if training_day_valid else FactorState(
             mean=self._factor_state.mean.copy(),
@@ -711,7 +750,6 @@ class OceanWave:
                 surface["pair_weight"].to_numpy(float),
             )
 
-        flow_summary = aggregate_large_flow(flow, self.config.flow, asof=flow_asof) if flow is not None else None
         inverse_inputs: list[InverseMarketData] = list(inverse_markets or ())
         if inverse_chain is not None or inverse_state is not None:
             inverse_inputs.insert(0, InverseMarketData(
@@ -722,18 +760,29 @@ class OceanWave:
             ))
         inverse_native, inverse_target, inverse_confidence, inverse_symbols = self._inverse_observations(inverse_inputs)
         factor_values, factor_confidences, factor_details = self._factor_observations(
-            surface,
             premium_signal,
             mean_pair_confidence,
             chain_summary,
             state,
-            short_data,
-            flow_summary,
             inverse_target,
             inverse_confidence,
+            market_context,
         )
         blend: FactorBlend = adaptive_blend(factor_values, factor_confidences, factor_state, self.config.factors)
+        inverse_target, inverse_confidence = factor_values[3], factor_confidences[3]
+        if "inverse_signal" in context:
+            # The live context replaces the optional legacy chain path; do not
+            # display a zero source count or a made-up native-space signal.
+            inverse_native = None
+            context_symbol = context.get("inverse_symbol")
+            inverse_symbols = ([context_symbol] if inverse_confidence > 0.0
+                               and isinstance(context_symbol, str) and 0 < len(context_symbol) <= 16 else [])
         event_variance_multiplier, event_confidence_multiplier, event_details = self._event_risk(event_context)
+        event_variance_multiplier *= macro_risk_multiplier
+        # The ELO curve shape is also evidence: leaving its raw amplitude in
+        # the PDE would bypass the explicit factor budget through a back door.
+        elo_weight = float(blend.weights[self.config.factors.names.index("premium_elo")])
+        budgeted_pair_signal = surface["pair_signal"].to_numpy(float) * elo_weight
 
         horizons = tuple(sorted(set(horizons_minutes or self.config.forecast_horizons_minutes)))
         if not horizons or horizons[0] <= 0.0:
@@ -746,7 +795,7 @@ class OceanWave:
             forecast = cpp_core.forecast_surface(
                 np.ascontiguousarray(surface["expiry_days"].to_numpy(float)),
                 np.ascontiguousarray(surface["distance_pct"].to_numpy(float)),
-                np.ascontiguousarray(surface["pair_signal"].to_numpy(float)),
+                np.ascontiguousarray(budgeted_pair_signal),
                 np.ascontiguousarray(surface["pair_weight"].to_numpy(float)),
                 np.ascontiguousarray(surface["pair_variance"].to_numpy(float)),
                 float(blend.signal),
@@ -791,6 +840,10 @@ class OceanWave:
                 adjusted_variance = float(return_variance) * event_variance_multiplier
                 expected_log_return = np.log1p(float(expected_return)) - 0.5 * float(return_variance)
                 probability_up = _normal_cdf(expected_log_return / max(sqrt(adjusted_variance), EPS))
+                if event_variance_multiplier != 1.0:
+                    expected_return = float(np.expm1(expected_log_return + 0.5 * adjusted_variance))
+                    expected_price = state.spot * exp(expected_log_return + 0.5 * adjusted_variance)
+                    price_variance = expected_price * expected_price * np.expm1(adjusted_variance)
                 expectations[float(horizon)] = Expectation(
                     float(horizon),
                     float(integrated),
@@ -798,7 +851,7 @@ class OceanWave:
                     float(expected_return),
                     float(expected_price),
                     adjusted_variance,
-                    float(price_variance) * event_variance_multiplier,
+                    float(price_variance),
                     float(probability_up),
                 )
             current_field_signal = float(forecast["current_field_signal"])
@@ -806,7 +859,8 @@ class OceanWave:
             confidence = float(forecast["confidence"])
             median_distance = float(forecast["median_distance"])
         else:
-            distances, expiries, observed, grid_weights = _surface_grid(surface)
+            budgeted_surface = surface.assign(pair_signal=budgeted_pair_signal)
+            distances, expiries, observed, grid_weights = _surface_grid(budgeted_surface)
             current_field_signal = _weighted_mean(observed.ravel(), grid_weights.ravel())
             distance_basis = np.exp(-np.abs(distances) / 0.08)
             expiry_basis = np.exp(-expiries / 45.0)
@@ -850,7 +904,6 @@ class OceanWave:
             trend_score = float(np.tanh(longest.average_signal))
             confidence = float(np.clip(
                 blend.confidence
-                * (0.35 + 0.65 * chain_summary.liquidity_quality)
                 * np.exp(-blend.projected_variance),
                 0.0,
                 1.0,
@@ -904,6 +957,11 @@ class OceanWave:
             "composite_signal": blend.signal,
             "composite_confidence": blend.confidence,
             "projected_factor_variance": blend.projected_variance,
+            "neutral_factor_weight": _canonical_float(blend.neutral_weight),
+            "factor_kkt_residual": _canonical_float(blend.kkt_residual),
+            "elo_field_weight": _canonical_float(elo_weight),
+            "factor_state_migration": self._state_migration,
+            "macro_risk_multiplier": macro_risk_multiplier,
             "current_field_signal": current_field_signal,
             "energy_signal": chain_summary.energy_signal,
             "iv_skew": chain_summary.iv_skew,
@@ -915,11 +973,6 @@ class OceanWave:
             "gex_net": chain_summary.gex_net,
             "gamma_multiplier": gamma_multiplier,
             "liquidity_quality": chain_summary.liquidity_quality,
-            "flow_velocity": float(flow_summary.velocity if flow_summary is not None else 0.0),
-            "large_flow_notional": float(flow_summary.large_net_notional if flow_summary is not None else 0.0),
-            "large_flow_gross_notional": float(flow_summary.large_gross_notional if flow_summary is not None else 0.0),
-            "large_flow_count": float(flow_summary.large_trade_count if flow_summary is not None else 0),
-            "dealer_hedge_shares": float(flow_summary.delta_hedge_shares if flow_summary is not None else 0.0),
             "inverse_native_signal": inverse_native,
             "inverse_target_signal": inverse_target,
             "inverse_confidence": inverse_confidence,
@@ -955,7 +1008,6 @@ class OceanWave:
             factor_table=blend.table.round(_PUBLIC_DECIMALS),
             factor_covariance=_canonical_array(factor_state.covariance.copy()),
             chain_factors=chain_summary,
-            flow_summary=flow_summary,
             expectations=expectations,
             elo_surface=surface,
             distance_grid=distances,

@@ -12,6 +12,9 @@ from typing import Any
 
 from ._atomic_io import replace_with_retry
 
+BASE_MODEL_VERSION = "ocean-wave.group-budget.v4"
+CALIBRATION_SCHEMA = "ocean-wave-shadow-calibration.v4"
+
 
 def _clip(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, float(value)))
@@ -46,9 +49,10 @@ class ShadowCalibrator:
         minimum_promotion_samples: int = 500,
         minimum_valid_days: int = 40,
     ) -> None:
-        # v1 mixed underlying direction and option P&L labels. Keep that audit
-        # file intact but never migrate its weights into the corrected target.
-        self.path = Path(state_dir).resolve() / "shadow-calibration.v2.json"
+        # v1 mixed direction/P&L labels; v2 calibrated the retired nine-factor
+        # forecast. Preserve both audit files, but never import their residuals
+        # into the group-budget model's different probability distribution.
+        self.path = Path(state_dir).resolve() / "shadow-calibration.v4.json"
         self.learning_rate = _clip(learning_rate, 0.001, 0.1)
         self.minimum_samples = max(10, int(minimum_samples))
         self.minimum_promotion_samples = max(
@@ -61,7 +65,8 @@ class ShadowCalibrator:
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
             return {
-                "schema_version": "ocean-wave-shadow-calibration.v2",
+                "schema_version": CALIBRATION_SCHEMA,
+                "base_model_version": BASE_MODEL_VERSION,
                 "updated_at": None,
                 "global": _new_bucket(),
                 "symbols": {},
@@ -69,8 +74,9 @@ class ShadowCalibrator:
                 "valid_training_days": [],
             }
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != "ocean-wave-shadow-calibration.v2":
-            raise ValueError("invalid shadow calibration state")
+        if (not isinstance(payload, dict) or payload.get("schema_version") != CALIBRATION_SCHEMA
+                or payload.get("base_model_version") != BASE_MODEL_VERSION):
+            raise ValueError("shadow calibration state has an incompatible base model version")
         return payload
 
     def _write(self) -> None:
@@ -103,6 +109,11 @@ class ShadowCalibrator:
     def apply_feedback(self, event: dict[str, Any]) -> dict[str, Any]:
         event_id = str(event.get("event_id", "")).strip()
         symbol = str(event.get("symbol", "")).strip().upper()
+        # Use the version frozen at entry, never the currently running version.
+        # Otherwise an old position closing after an upgrade contaminates the
+        # new bucket even though the new on-disk filename is isolated.
+        if event.get("base_model_version") != BASE_MODEL_VERSION:
+            return self.status(symbol, duplicate=False, status="incompatible_base_model_ignored")
         probability = float(event.get("predicted_profit_probability"))
         observed = event.get("observed_profitable")
         if not event_id or not symbol or not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
@@ -160,6 +171,7 @@ class ShadowCalibrator:
             and valid_days >= self.minimum_valid_days
         )
         return {
+            "base_model_version": BASE_MODEL_VERSION,
             "raw_profit_probability": raw,
             "calibrated_profit_probability": _clip(calibrated, 0.0, 1.0),
             "global_samples": total_samples,
@@ -176,7 +188,8 @@ class ShadowCalibrator:
         symbol_bucket = self.state.get("symbols", {}).get(symbol.upper(), _new_bucket())
         valid_days = len({str(value) for value in self.state.get("valid_training_days", [])})
         return {
-            "schema_version": "ocean-wave-shadow-calibration.v2",
+            "schema_version": CALIBRATION_SCHEMA,
+            "base_model_version": BASE_MODEL_VERSION,
             "status": status or ("duplicate_ignored" if duplicate else "updated"),
             "deployment_status": "shadow_only",
             "global_samples": int(global_bucket.get("samples", 0)),
@@ -191,4 +204,4 @@ class ShadowCalibrator:
         }
 
 
-__all__ = ["ShadowCalibrator"]
+__all__ = ["ShadowCalibrator", "BASE_MODEL_VERSION", "CALIBRATION_SCHEMA"]

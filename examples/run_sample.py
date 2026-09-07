@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from option_wave import MarketState, OceanWave, ShortData
+from option_wave import MarketState, OceanWave
 
 
 def make_sample_chain() -> pd.DataFrame:
@@ -53,7 +53,6 @@ def main() -> None:
             rvol=1.2,
             realized_vol=0.25,
         ),
-        short_data=ShortData(short_interest_ratio=0.08, short_volume_ratio=0.48, days_to_cover=1.7),
     )
     print(f"TrendScore: {result.trend_score:+.3f}")
     print(f"Direction: {result.direction}")

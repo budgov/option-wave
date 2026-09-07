@@ -53,11 +53,15 @@ background supervisors, account actions, or order execution.
 ## Implementation and verification
 
 Use C++17 for numerical hot paths: pairing/interpolation, ELO, surface factors,
-flow aggregation, covariance weighting, stable PDE solves, horizon integration,
+bounded correlation-budget weighting, stable PDE solves, horizon integration,
 online learning, and contract-profit integration. Prefer bounded buffers, RAII,
 validated dimensions, and reusable factorizations. Avoid process-global mutable
 model state and unnecessary allocations. Keep a Python numerical reference
 where needed for independent parity and convergence checks.
+
+Retired flow/short-pressure interfaces must not reappear as compatibility
+fallbacks. Keep neutral missing-factor reserves, measured feature masks,
+versioned state migration and the shadow-only v3 learning boundary explicit.
 
 Python provides HTTPS/API adapters, DataFrame normalization, public objects,
 receipt validation, and checkpoint orchestration. Preserve `OceanWave` and the

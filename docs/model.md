@@ -18,8 +18,8 @@ Both sides use the same direction-neutral distance cost:
 R(d)=d^p.
 \]
 
-IV skew, liquidity, and short pressure remain independent evidence or risk
-modifiers; they do not alter the Call/Put energy denominator.
+IV skew and liquidity remain separate evidence or risk modifiers; they do
+not alter the Call/Put energy denominator.
 
 The equalized premium forces are
 
@@ -92,169 +92,149 @@ VRP_t=\sigma_{ATM,t}-\sigma_{realized,t}
 
 is a risk/variance modifier, not a forced directional vote.
 
-## 4. Energy, OI, GEX, and dealer hedge
+## 4. Diagnostic option structure, not institutional positions
 
-Liquidity-adjusted option energy is integrated over the chain:
+Chain volume, open interest and unsigned Greeks do not identify an observed
+aggressor, opening trade, dealer inventory or beneficial owner. Their quality,
+coverage, changes and unsigned exposure remain diagnostics and uncertainty
+inputs. They no longer supply separate institutional-flow, short-pressure,
+OI-direction, dealer-hedge or option-energy directional votes.
 
-\[
-\mathcal E_c=\iint 100\,C\,V_c\,|\Delta_c|\,
-e^{-|\log(K/S)|/b}e^{-\tau/T}\,dK\,d\tau,
-\]
+The retired nine-factor coefficients must not be restored by missing-data
+fallbacks. Historical diagnostic records remain evidence; they are not new
+training features merely because their old names still appear in an archive.
 
-with the same definition for \(\mathcal E_p\). Its bounded direction is
+## 5. Explicit, aligned inverse observations
 
-\[
-f_E=\tanh\left(\frac{\mathcal E_c-\mathcal E_p}{\mathcal E_c+\mathcal E_p+\epsilon}\right).
-\]
-
-When OI changes are available,
-
-\[
-f_{OI}=\tanh\left(
-\frac{\iint |\Delta_c|\,dOI_c-\iint |\Delta_p|\,dOI_p}
-{\iint |\Delta_c|\,|dOI_c|+\iint |\Delta_p|\,|dOI_p|+\epsilon}
-\right).
-\]
-
-Without a stable previous-contract observation, static OI is retained as a
-regime diagnostic but contributes zero directional OI confidence.
-
-Structural gamma exposure is
+For an inverse product with stated daily leverage \(\beta<0\), use the same
+causal window \([t-h,t]\) as the target and map log return to target units:
 
 \[
-GEX_t=100S_t^2\iint\left(OI_c|\Gamma_c|-OI_p|\Gamma_p|\right)W\,dK\,d\tau.
+r_{inverse,h}^{target}=
+\frac{\log(P_{inverse,t}/P_{inverse,t-h})}{\beta}.
 \]
 
-Because public chains do not reveal dealer inventory sign, this is treated as
-a regime estimate. Verified trade flow supplies a stronger hedge observation:
+The production pairs are QQQ/SQQQ (-3x daily), SPY/SH (-1x), TSLA/TSLS (-1x)
+and AAPL/AAPD (-1x). Daily leverage is a stated target, not an assumption of
+perfect intraday or multi-day tracking. Quotes must be fresh, timestamped,
+non-delayed and no later than the forecast cutoff. Reference observations
+must match the same session/window; missing windows remain missing.
 
-\[
-dH_i=100N_i|\Delta_i|\delta_i,
-\qquad
-dG_i=100N_i|\Gamma_i|S_t^2\delta_i,
-\]
+A bounded signal and observed confidence summarize the aligned inverse
+returns. Correlation with the underlying is explicitly penalized by section 8;
+another ticker is not automatically independent evidence.
 
-where \(\delta_i=+1\) for buy Call/sell Put, \(-1\) for sell Call/buy Put,
-and zero when aggressor direction is unknown.
+## 6. Macro context and risk
 
-## 5. Institutional flow integral
+The four macro channels are gold, U.S. 10-year Treasury yield, the dollar
+index and VIX. No fixed sign such as "gold up means stocks down" is imposed.
 
-For premium \(P_i\), contracts \(N_i\), confidence \(c_i\), age \(a_i\),
-and half-life \(h\), decayed signed notional is
+Retain observed instrument, source, timestamp, units and proxy status. GLD is
+a gold-ETF proxy, not spot gold. UUP is a dollar-futures ETF diagnostic, not a
+silent dollar-index replacement. Schwab uses $NYICDX for the ICE U.S. Dollar
+Index. A Treasury price is not a yield; $TNX requires verified provider identity
+and the explicit Cboe 10-times-yield unit contract, with verified historical
+references. Unverified units make the yield feature missing rather than
+numerically plausible.
 
-\[
-q_i(t)=100N_iP_i c_i\delta_i e^{-\ln(2)a_i/h}.
-\]
+Raw macro observations can widen forecast uncertainty through a bounded risk
+multiplier and enter mature supervised context learning. Main-model macro
+direction is missing until a validated directional mapping is supplied.
+A reserved macro budget is not an instruction to manufacture a sign.
 
-The large-flow signal and velocity are
+## 7. Maximum-entropy information-group budgets
 
-\[
-f_W=\tanh\left(\frac{\sum_{i\in Whale}q_i}{\sum_{i\in Whale}|q_i|+\epsilon}\right),
-\]
-
-\[
-v_W=\tanh\left(\frac{Q_{recent}}{|Q_{recent}|}-\frac{Q_{prior}}{|Q_{prior}|}\right).
-\]
-
-Unknown trade direction has zero confidence; it is never guessed from stock
-price behavior.
-
-## 6. Short pressure and squeeze interaction
-
-Normalized short observations are mapped into bounded features \(z_j\): short
-interest/float, change in short interest, short-volume ratio, borrow fee,
-utilization, and days to cover. Their internal pressure is
-
-\[
-p_s=\frac{\sum_j\rho_jz_j}{\sum_j\rho_j}.
-\]
-
-The directional factor includes an interaction with positive stock
-confirmation \(f_S\):
-
-\[
-f_{short}=\operatorname{clip}\left(-p_s+1.6[p_s]^+[f_S]^+,-1,1\right).
-\]
-
-High short pressure is bearish until positive price confirmation creates a
-squeeze regime.
-
-For an explicitly registered inverse product with daily beta \(\beta_k<0\),
-the native bounded signal is direction-mapped and leverage-normalized:
-
-\[
-f_{inverse,k}=\operatorname{sign}(\beta_k)\tanh\left(
-\frac{\operatorname{atanh}(s_{inverse,k})}{\max(|\beta_k|,1)}
-\right).
-\]
-
-Several available inverse products are combined by observed data confidence.
-
-## 7. Factor vector and structural priors
-
-The directional state is
+The main factor order is
 
 \[
 \mathbf f_t=
 \begin{bmatrix}
-f_{ELO}&f_W&f_H&f_{IV}&f_{short}&f_{OI}&f_S&f_{inverse}&f_E
-\end{bmatrix}^T.
+f_{ELO}&f_{IV}&f_S&f_{inverse}&f_{gold}&f_{10y}&f_{USD}&f_{VIX}
+\end{bmatrix}^{T}.
 \]
 
-The prior importance vector is
+The budget vector is
 
 \[
-\boldsymbol\pi=
+\mathbf b=
 \begin{bmatrix}
-.22&.16&.14&.12&.10&.09&.08&.05&.04
-\end{bmatrix}^T.
+.125&.125&.25&.25&.0625&.0625&.0625&.0625
+\end{bmatrix}^{T}.
 \]
 
-Each factor also has observed confidence \(q_i\in[0,1]\). Missing evidence has
-\(q_i=0\), so it cannot influence the result.
+With no validated comparative skill estimates, four information groups each
+receive 25%: options, underlying, inverse confirmation and macro context.
+Maximizing \(-\sum_{g=1}^{4}b_g\log b_g\) subject to \(b_g\ge0\) and
+\(\sum_gb_g=1\) yields equal group allocations. Options are split evenly
+between ELO/IV; macro is split four ways. This is a transparent initial prior,
+**not** the optimum for future predictive accuracy.
 
-## 8. Online covariance and adaptive matrix weights
+For confidence \(q_i\in[0,1]\), define a hard upper budget \(u_i=b_iq_i\).
+Missing, stale, unaligned or unverified evidence has \(q_i=0\).
 
-The online mean and covariance use continuous EWMA updates:
+## 8. Bounded convex redundancy allocation
+
+A masked positive-semidefinite EWMA covariance \(\Sigma_t\) uses
+\(\alpha=.08\). Missing observations do not decay their diagonal variance
+toward zero. Let \(C_t=\operatorname{corr}(\Sigma_t)\); the redundancy matrix is
 
 \[
-\boldsymbol\mu_t=(1-\alpha)\boldsymbol\mu_{t-1}+\alpha\mathbf f_t,
+R_t=(1-s)(C_t\odot C_t)+sI,\qquad s=.25,
 \]
+
+where \(\odot\) is elementwise multiplication. Both positive and negative
+correlation represent redundant evidence. The Schur product preserves positive
+semidefiniteness; shrinkage keeps the penalty well-conditioned.
+
+With \(H_t=(1-\lambda)I+\lambda R_t\), \(\lambda=.25\), solve
 
 \[
-\boldsymbol\Sigma_t=(1-\alpha)\boldsymbol\Sigma_{t-1}
-+\alpha(\mathbf f_t-\boldsymbol\mu_{t-1})(\mathbf f_t-\boldsymbol\mu_t)^T.
+\boxed{
+\min_{\mathbf w}\ \frac12\mathbf w^TH_t\mathbf w-\mathbf u^T\mathbf w
+\quad\text{subject to }0\le w_i\le u_i
+}.
 \]
 
-The non-negative ridge-GLS projection is
+For \(0\le\lambda<1\), the positive-definite quadratic has a unique constrained minimizer.
+Its diagonal is one: an isolated fully observed factor retains its own budget,
+instead of receiving a penalty for correlation with itself. The
+bounded coordinate solver uses at most 512 iterations and a projected-gradient
+KKT tolerance of \(10^{-9}\). C++ and the Python numerical reference must agree.
+
+Do **not** divide the resulting weights by their sum. Instead record
 
 \[
-\widetilde{\mathbf w}_t=
-\left[(\boldsymbol\Sigma_t+\lambda I)^{-1}
-(\boldsymbol\pi\odot\mathbf q_t)\right]_+,
-\qquad
-\mathbf w_t=\frac{\widetilde{\mathbf w}_t}
-{\mathbf 1^T\widetilde{\mathbf w}_t}.
+w_{neutral}=1-\sum_iw_i,\qquad
+z_t=\mathbf w^T\mathbf f_t,\qquad
+V_{factor,t}=\mathbf w^T\Sigma_t\mathbf w.
 \]
 
-The global directional source and its factor uncertainty are
+The neutral remainder contributes zero directional score. Removed or missing
+evidence cannot inflate the ELO weight; even a fully observed ELO has a 12.5%
+budget ceiling. These effective allocations control redundancy and evidence
+coverage, not estimated causal truth or guaranteed performance.
 
-\[
-z_t=\mathbf w_t^T\mathbf f_t,qquad
-V_{factor,t}=\mathbf w_t^T\boldsymbol\Sigma_t\mathbf w_t.
-\]
+Evidence confidence is \(C_t=\sum_iw_i\), not \(\sum_iw_iq_i\): observation
+quality already enters the eligible budget. Final confidence applies the
+factor-uncertainty discount \(C_t\exp(-V_{factor,t})\); it does not repeat the
+option-liquidity penalty across all factors. Liquidity still enters option
+observation quality, PDE diffusion, forecast variance and execution costs.
+This confidence is evidence coverage, not an empirically calibrated hit rate.
 
-This preserves the requested importance order as a prior while reducing
-correlated or unstable factors at runtime.
 
 ## 9. Continuous Ocean Wave PDE and matrix form
 
 The ELO topology and global projection are coupled with the basis
 
 \[
-b(d,\tau)=e^{-|d|/0.08}e^{-\tau/45},qquad
-u_t=\psi_{ELO}+b(d,\tau)(z_t-\bar\psi_{ELO}).
+b(d,\tau)=e^{-|d|/0.08}e^{-\tau/45},\qquad
+u_t=w_{ELO}\psi_{ELO}
++b(d,\tau)(z_t-w_{ELO}\bar\psi_{ELO}).
 \]
+
+The source receives an independent copy of the ELO topology scaled by its
+effective factor allocation. The raw ELO surface stays available for audit;
+it cannot silently become a full-strength second path around the budget.
 
 The field is a signed score in \([-1,1]\), not a price probability density.
 Distance \(d\) is a return fraction (0.01 means 1%), expiry \(\tau\) is in
@@ -276,8 +256,10 @@ The field evolves as
 }.
 \]
 
-Negative GEX increases source amplification; positive GEX damps it. Wide
-spreads and VRP stress increase diffusion/forecast variance.
+Unsigned gamma structure remains an audited diagnostic, not a measured dealer
+position or a signed source multiplier. The gamma multiplier is currently 1.
+Wide spreads, VRP stress and macro-risk context can increase diffusion or
+forecast variance.
 
 Both ends of each coordinate axis use homogeneous Neumann conditions
 \(\partial_n\psi=0\): no diffusive boundary flux and a constant ghost value
@@ -333,7 +315,7 @@ For integration weight \(W(d,\tau)\),
 \]
 
 \[
-I_H=\int_0^H\bar\psi(t)dt,qquad \bar\psi_H=I_H/H.
+I_H=\int_0^H\bar\psi(t)dt,\qquad \bar\psi_H=I_H/H.
 \]
 
 Trapezoidal quadrature integrates the piecewise-linear score trajectory at
@@ -349,7 +331,8 @@ Expected log return is
 \mu_H=\bar\psi_H\sigma\sqrt{H/Y}\,a_\Gamma(t),
 \]
 
-where \(a_\Gamma\) is the GEX regime multiplier. Forecast variance is
+where \(a_\Gamma=1\): the former signed dealer/GEX multiplier is retired.
+Forecast variance is
 
 \[
 V_H=\sigma^2\frac{H}{Y}\left[
@@ -486,41 +469,121 @@ b\leftarrow\operatorname{clip}(b+\eta_n(y-\hat p)\operatorname{logit}(p),.5,1.5)
 \]
 
 Event identifiers make feedback idempotent. Invalid sessions do not mutate
-state. In calibration v2, verified losses can move the probability across 0.5;
-the former same-side shrinkage restriction has been removed. Readiness blends
-the raw and fitted probabilities until the sample threshold is reached.
-Legacy v1 files mixed direction and option-profit targets and are not migrated.
-The default promotion eligibility counters require 500 mature samples and 40
-valid trading days. These counters do not perform deployment or establish
-out-of-sample profitability; promotion remains an external research decision.
+state. The v4 calibrator blends raw and fitted probability according to
+readiness; a fitted direction can cross 0.5 rather than being permanently
+locked to the old direction. Its base model is `ocean-wave.group-budget.v4`.
+Old mixed-target v1 and retired-model v2/v3 calibration files remain untouched and
+are not loaded. Feedback must carry the base-model version frozen at entry;
+old or unversioned positions cannot train the new bucket merely because they
+close after the upgrade.
+Default 500 mature samples and 40 valid trading days are eligibility gates,
+not deployment authorization or evidence that calibration improves accuracy.
 
-## 16. Supervised online challenger
+## 16. Mature supervised option and context challengers
 
-`OnlineForecastChallenger` maintains independent, bounded state for each
-supported symbol (QQQ, SPY, TSLA, AAPL) and forecast horizon. The numerical
-kernels are implemented in `cpp/online_forecast.hpp`; Python validates input
-schemas, causal timestamps, immutable receipts and checkpoint integrity.
+The native `online_forecast.v3` learner compares five bounded experts:
+stock-only, fused stock/options, context, trend and reversion. This is a
+candidate-only learner, separate from sections 7–8's main-model budgets. It
+does not automatically replace or promote the deployed forecast.
 
-The stock model is a regularized logistic predictor. The conditional model
-adds regularized option features after removing their fitted stock-feature
-component in log-odds space. Trend and reversion experts are additional
-comparators. Hedge-style weights are updated from their issued-time Brier
-losses, not from contemporaneous premium ELO or binary score totals. Missing
-features have explicit masks; no signed dealer flow is inferred from volume.
+The schema contains eight stock observations, eleven option observations and
+seven context observations. In fixed order, the option observations are
+`premium_elo_signal`, `premium_elo_confidence`, `iv_skew`, `iv_level`,
+`iv_term_slope`, `iv_curvature`, `volatility_risk_premium`, `gamma_imbalance`,
+`gamma_concentration`, `liquidity_quality` and `option_activity`. Their units
+and availability rules are specified in the
+[data contract](data_integration.md#native-v3-option-feature-contract).
+Directional OI and unverifiable signed-flow slots remain retired. Gamma
+imbalance and concentration describe public unsigned chain structure, not
+known dealer inventory or a predefined direction.
 
-Prediction does not train the model. Every receipt freezes raw features,
-probabilities, expert weights, expected return and an interval. `learn` requires
-a mature, eligible outcome; duplicate forecast/event identifiers and stale
-outcomes do not update state. Callers must verify price alignment and session
-eligibility. A positive realized return is the up label; zero is not-up.
+The context vector contains aligned inverse returns over 5 and 15 minutes,
+gold-proxy 5-minute return, 10-year yield change in basis points, dollar-index
+5-minute return, VIX change and VIX level. Conditional coefficients learn from
+mature labels instead of hard-coding macro signs.
 
-`learn_replay` can rebuild from an eligible ledger after invalidating a session.
-It re-encodes the original raw features against the current learning state for
-gradients, while scoring experts and interval coverage against the original
-frozen predictions. It never replaces a historical forecast with hindsight.
+**Causal standardization and conditional option learning.** Each measured
+feature is standardized using statistics from eligible mature observations,
+with a feature-specific scale floor and clipping to [-4, 4]. An explicit
+missing mask distinguishes an absent measurement from an observed zero;
+missing-indicator design terms have scale 0.25. For a standardized option or
+context observation `z_j`, the conditional input is
+`r_j = clip(z_j - beta_j^T x_stock, -4, 4)`, with bounded, regularized
+conditioning coefficients learned only after maturity.
 
-EWMA return statistics, change diagnostics and a 256-observation scaled-error
-buffer support adaptive intervals. This is not a guarantee of conditional
-coverage or a claim that market prices follow a stable physical law. Fourier
-features are causal diagnostics, not extrapolated deterministic price cycles.
-The challenger remains shadow-only and does not place trades or promote itself.
+Premium ELO is an explicit learnable option residual, not a fixed 12.5%
+allocation in this candidate. Its residual is multiplied by its measured
+confidence; absent or zero confidence disables the ELO observation. Three
+clipped interaction terms require all measured parents: confidence-gated
+ELO residual times normalized IV skew, ELO residual times raw gamma
+concentration, and normalized stock 5-minute return times normalized IV term.
+No parent observation is synthesized to enable an interaction.
+
+`option_feature_coverage` is the effective observed option count divided by
+11. It is a diagnostic, not an additional signal-amplitude penalty. The
+option gate is the supplied evidence quality when at least one effective
+option observation exists, otherwise zero. The context gate remains its
+observed count divided by seven. Gradients are normalized by measured value
+and interaction terms, excluding missing-indicator count, so adding absent
+columns does not dilute an already valid feature's learning. Stock and
+option coefficients have L2 regularization 0.005 and bounded updates; the
+stock intercept is exempt from that penalty.
+
+The raw stock logit is clipped to [-4, 4]. Each conditional option/context
+increment is separately clipped to [-4, 4], then multiplied by its quality
+gate. The fused and context experts apply the logistic function to the stock
+logit plus their corresponding increment. Warm-up probabilities shrink
+toward 0.5 with factor `n / (n + 32)`, where `n` is the eligible mature sample
+count. Receipt explanations retain the normalized inputs, effective designs,
+observed masks, individual pre-clip logit contributions and quality gates.
+These are conditional log-odds contributions, not percentage allocations or
+an exact additive decomposition of the final ensemble probability.
+
+**Frozen proper-loss expert learning.** Initial expert weights are 20% each.
+For an eligible mature label `y = 1[actual_return > 0]`, use each expert's
+probability frozen at issuance, not a reissued prediction:
+
+```text
+loss_e = (p_e_frozen - y)^2
+logw_e = (1 - 0.001) * logw_e - 0.05 * loss_e
+logw_e = clip(logw_e - max(logw), -8, 0)
+weight_e = exp(logw_e) / sum(exp(logw))
+```
+
+The former 10% hard expert floor is removed. Bounded log weights keep the
+softmax finite, and explicit weak prior reversion permits recovery without
+reserving an arbitrary percentage for each expert. This is prequential
+out-of-sample-at-issue loss learning, not evidence that weights are optimal
+on unseen market regimes.
+
+Each symbol/horizon has fixed numerical state (715 doubles, including a
+256-score rolling interval window); the Python boundary additionally bounds
+model count, duplicate tracking and checkpoint size. Immutable, digest-checked
+v3 receipts freeze inputs, probabilities, issue time, maturity and the
+training watermark. Old v1/v2 state and receipts are rejected, not silently
+reinterpreted under a wider feature schema. Every valid mature direction
+receives +1 when correct and -1 when wrong. A zero return is `not_up`, and a
+probability equal to 0.5 also selects `not_up`; Brier/log losses remain
+separate probability metrics. Absent or unaligned outcomes stay unscored.
+Only eligible mature observations update learning; duplicate receipts do not
+train twice. Replay may re-encode gradients under the rebuilt learner, but
+retains original issued probabilities and historical scores. Synthetic
+feature-learning and replay tests verify behavior, not improved market
+accuracy or permission to promote the candidate.
+
+## 17. State and data migration
+
+The main model writes named-factor v3 state with weighting scheme
+`bounded-correlation-budget.v2`. Valid old v1/v2 states may retain independent
+ELO ratings, but old covariance/means are reset, not reinterpreted under the
+new evidence-quality contract. V2's identities and covariance are validated
+before migration. Profit calibration uses v4 and accepts only frozen
+current-base forecasts. Host-specific minute-lead calibration is not shipped.
+Online feature dimensions and model versions are similarly isolated.
+
+This migration does not delete source evidence, market timestamps, frozen
+predictions or scored outcomes. An old
+record's original factor table is evidence of that forecast, not the current
+weight configuration. Host applications must preserve that evidence separately
+from disposable build artifacts. Private storage maintenance is not part of
+this model-only package.

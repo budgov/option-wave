@@ -15,6 +15,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from option_wave.realtime import HAS_CPP_CORE, RealtimePredictor, validate_horizons
 from option_wave.intraday_features import extract_intraday_price_features
 from option_wave.online_forecast import OnlineForecastChallenger
+from option_wave.market_context import prepare_market_context
 
 MAX_REQUEST_BYTES = 256 * 1024
 
@@ -116,11 +117,20 @@ def main() -> None:
                 if command == "shadow_forecast":
                     if request.get("state") is not None:
                         challenger = OnlineForecastChallenger.from_state(request["state"])
+                    context_features = request.get("context_features")
+                    if request.get("market_context") is not None:
+                        stock_features = request.get("stock_features")
+                        context_features = prepare_market_context(
+                            request["market_context"], symbol=request.get("symbol", ""),
+                            issued_at=request.get("issued_at"),
+                            realized_vol=stock_features.get("realized_vol") if isinstance(stock_features, dict) else None,
+                        )["context_features"]
                     result = challenger.predict(
                         symbol=request.get("symbol"), horizon=request.get("horizon"),
                         stock_features=request.get("stock_features"), option_features=request.get("option_features"),
                         quality=request.get("quality"), origin_price=request.get("origin_price"),
                         forecast_id=request.get("forecast_id"), issued_at=request.get("issued_at"),
+                        context_features=context_features,
                     )
                     emit({"id": request_id, "ok": True, "result": result})
                     continue
@@ -169,6 +179,7 @@ def main() -> None:
                         strike=request.get("strike"),
                         option_type=request.get("option_type"),
                         market_state_overrides=request.get("market_state_overrides"),
+                        market_context=request.get("market_context"),
                         checkpoint_async=True,
                         training_day_valid=request.get("training_day_valid", True),
                         maximum_snapshot_age_seconds=request.get("maximum_snapshot_age_seconds"),

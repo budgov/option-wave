@@ -18,20 +18,30 @@ from typing import Any
 
 from ._backend import cpp_core
 
-VERSION = "online_forecast.v1"
+VERSION = "online_forecast.v3"
 SYMBOLS = frozenset({"QQQ", "SPY", "TSLA", "AAPL"})
 STOCK_FEATURES = (
     "return_5m", "return_15m", "vwap_gap", "relative_volume",
     "market_return_5m", "sector_return_5m", "realized_vol", "day_return",
 )
-OPTION_FEATURES = ("iv_skew", "iv_level", "gamma_imbalance", "oi_imbalance", "delta_flow")
-EXPERTS = ("stock", "fused", "trend", "reversion")
+OPTION_FEATURES = (
+    "premium_elo_signal", "premium_elo_confidence", "iv_skew", "iv_level",
+    "iv_term_slope", "iv_curvature", "volatility_risk_premium",
+    "gamma_imbalance", "gamma_concentration", "liquidity_quality", "option_activity",
+)
+CONTEXT_FEATURES = ("inverse_return_5m", "inverse_return_15m", "gold_return_5m",
+                    "treasury_10y_change_bps", "dollar_return_5m", "vix_change", "vix_level")
+EXPERTS = ("stock", "fused", "context", "trend", "reversion")
+INTERACTIONS = ("elo_x_iv_skew", "elo_x_gamma_concentration", "stock_5m_x_iv_term")
+EXPERT_WEIGHT_RULE = {"algorithm": "prior_reverting_prequential_brier_hedge", "eta": 0.05,
+                     "prior_reversion": 0.001, "log_weight_minimum": -8.0, "hard_floor": 0.0}
 MAX_MODELS = 64
 MAX_RECENT_EVENTS = 512
 MAX_IDENTIFIER_LENGTH = 192
 MAX_STATE_BYTES = 12 * 1024 * 1024
 MIN_TRAINING_SAMPLES = 32
-HAS_ONLINE_CORE = cpp_core is not None and hasattr(cpp_core, "online_forecast_predict")
+HAS_ONLINE_CORE = (cpp_core is not None and hasattr(cpp_core, "online_forecast_predict")
+                   and getattr(cpp_core, "ONLINE_FORECAST_VERSION", None) == VERSION)
 
 
 def _finite(value: Any, name: str) -> float:
@@ -131,9 +141,13 @@ class OnlineForecastChallenger:
     """Issue shadow receipts, then learn once from eligible mature outcomes.
 
     Returns/price gaps are decimal fractions; volatility is annualized decimal;
-    relative_volume is a ratio. Gamma/OI/Delta flow inputs are bounded normalized
-    features. Delta flow must be None unless supported by reliable trade evidence.
+    relative_volume is a ratio. Gamma imbalance is a normalized structure proxy.
+    Context returns are same-session log returns, inverse returns are leverage-
+    normalized, yield changes are basis points, and VIX values are index points.
     The quality gate must describe the option evidence, not stock direction.
+    ELO/confidence, gamma concentration and liquidity use bounded unit scores;
+    IV geometry uses decimal-volatility units. Option activity is log1p of the
+    measured volume-times-absolute-delta sum, not guessed signed money flow.
 
     predict() is read-only, including normalizers and conditioning regressions.
     A caller checkpoint rollback must precede rebuilding invalidated history.
@@ -147,7 +161,7 @@ class OnlineForecastChallenger:
 
     def predict(self, symbol: str, horizon: int, stock_features: Any,
                 option_features: Any, quality: float, origin_price: float,
-                forecast_id: str, issued_at: Any) -> dict[str, Any]:
+                forecast_id: str, issued_at: Any, context_features: Any = None) -> dict[str, Any]:
         symbol, horizon, key = _key(symbol, horizon)
         forecast_id = _identifier(forecast_id, "forecast_id")
         issued = _timestamp(issued_at, "issued_at")
@@ -157,6 +171,7 @@ class OnlineForecastChallenger:
             raise ValueError("origin_price or option quality is outside supported bounds")
         stock = _features(stock_features, STOCK_FEATURES, "stock_features")
         options = _features(option_features, OPTION_FEATURES, "option_features")
+        context = _features(context_features, CONTEXT_FEATURES, "context_features")
         with self._lock:
             model = self._models.get(key)
             if model is None:
@@ -167,10 +182,29 @@ class OnlineForecastChallenger:
                 raise ValueError("prediction precedes the mature training watermark")
             native = dict(cpp_core.online_forecast_predict(model["native_state"],
                 [math.nan if item is None else item for item in stock],
-                [math.nan if item is None else item for item in options], gate, horizon))
+                [math.nan if item is None else item for item in options + context], gate, horizon))
+            stock_terms = list(native.pop("stock_logit_contributions"))
+            option_terms = list(native.pop("option_logit_contributions"))
+            normalized_options = list(native.pop("normalized_option_features"))
+            effective_design = list(native.pop("effective_option_design"))
+            observed_mask = list(native.pop("observed_feature_mask"))
+            stock_term_names = ("intercept",) + STOCK_FEATURES + tuple(f"missing.{name}" for name in STOCK_FEATURES)
+            measured_names = tuple(f"option.{name}" for name in OPTION_FEATURES) + tuple(f"context.{name}" for name in CONTEXT_FEATURES)
+            option_term_names = measured_names + tuple(f"missing.{name}" for name in measured_names) + tuple(f"interaction.{name}" for name in INTERACTIONS)
+            if (len(stock_terms) != len(stock_term_names) or len(option_terms) != len(option_term_names)
+                    or len(normalized_options) != len(measured_names)
+                    or len(effective_design) != len(option_term_names)
+                    or len(observed_mask) != len(STOCK_FEATURES) + len(measured_names)):
+                raise RuntimeError("native feature attribution dimensions disagree with v3 schema")
+            transforms = {
+                name: {"observed": bool(observed_mask[len(STOCK_FEATURES) + index]),
+                       "normalized": normalized_options[index],
+                       "conditional_design": effective_design[index]}
+                for index, name in enumerate(measured_names)
+            }
             receipt: dict[str, Any] = {
                 "model_version": VERSION,
-                "feature_version": 1,
+                "feature_version": 3,
                 "shadow_only": True,
                 "symbol": symbol,
                 "horizon": horizon,
@@ -180,11 +214,23 @@ class OnlineForecastChallenger:
                 "origin_price": spot,
                 "stock_features": dict(zip(STOCK_FEATURES, stock)),
                 "option_features": dict(zip(OPTION_FEATURES, options)),
+                "context_features": dict(zip(CONTEXT_FEATURES, context)),
                 "input_quality": gate,
                 "training_watermark": model["watermark"],
                 "training_state_digest": _digest(model["native_state"]),
                 "probabilities_up": dict(zip(EXPERTS, native.pop("expert_probabilities"))),
                 "expert_weights": dict(zip(EXPERTS, native.pop("expert_weights"))),
+                "expert_weight_rule": dict(EXPERT_WEIGHT_RULE),
+                "feature_attributions": {
+                    "scale": "pre_clip_conditional_log_odds_not_percentage_weights",
+                    "stock": dict(zip(stock_term_names, stock_terms)),
+                    "option_and_context": dict(zip(option_term_names, option_terms)),
+                    "transforms": transforms,
+                    "interaction_design": dict(zip(INTERACTIONS, effective_design[-len(INTERACTIONS):])),
+                    "gates": {"option_quality": native["option_quality"], "context_quality": native["context_quality"]},
+                    "conditional_logit_limit": 4.0,
+                    "missing_indicator_scale": 0.25,
+                },
                 "readiness": "trained" if native["trained_samples"] >= MIN_TRAINING_SAMPLES else "warmup",
                 "interval_method": "rolling_scaled_error_adaptive_alpha",
                 "interval_target_coverage": 0.90,
@@ -224,7 +270,8 @@ class OnlineForecastChallenger:
         event_id = _identifier(event_id, "event_id")
         forecast_id = _identifier(forecast.get("forecast_id"), "forecast_id")
         symbol, horizon, key = _key(forecast.get("symbol"), forecast.get("horizon"))
-        if forecast.get("model_version") != VERSION or forecast.get("shadow_only") is not True:
+        if (forecast.get("model_version") != VERSION or forecast.get("feature_version") != 3
+                or forecast.get("shadow_only") is not True):
             raise ValueError("forecast receipt has an incompatible model version")
         frozen_values = forecast.get("frozen_native")
         if not isinstance(frozen_values, list) or len(frozen_values) != cpp_core.ONLINE_FORECAST_FROZEN_SIZE:
